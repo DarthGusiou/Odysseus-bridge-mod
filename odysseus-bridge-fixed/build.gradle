@@ -1,0 +1,63 @@
+// build.gradle — Odysseus Bridge addon
+// Builds a Fabric mod that depends on Baritone (via the Meteor Baritone addon)
+// and connects to Odysseus via a local WebSocket.
+
+plugins {
+    id 'fabric-loom' version '1.10-SNAPSHOT'
+    id 'java'
+}
+
+// These get set in gradle.properties.
+version = project.mod_version
+group   = project.maven_group
+
+base { archivesName = project.archives_base_name }
+
+repositories {
+    mavenCentral()
+    maven { url = "https://maven.fabricmc.net/" }
+    maven { url = "https://jitpack.io" }
+    // Baritone
+    maven { url = "https://impactdevelopment.github.io/maven/" }
+    maven { url = "https://maven.meteordev.org/releases" }
+    maven { url = "https://maven.meteordev.org/snapshots" }
+}
+
+dependencies {
+    minecraft "com.mojang:minecraft:${project.minecraft_version}"
+    mappings  "net.fabricmc:yarn:${project.yarn_mappings}:v2"
+    modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+    modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
+
+    // WebSocket client (bundled into the mod jar)
+    implementation include('org.java-websocket:Java-WebSocket:1.5.6')
+
+    // Baritone API — resolved from Meteor's Maven at runtime
+    modImplementation "meteordevelopment:baritone-api-fabric:${project.baritone_version}"
+
+    // Meteor Client API (optional — we use it for hooks, falls back if missing)
+    modImplementation("meteordevelopment:meteor-client:${project.meteor_version}") { transitive = false }
+}
+
+processResources {
+    inputs.property "version", project.version
+    filesMatching("fabric.mod.json") {
+        expand "version": project.version
+    }
+}
+
+tasks.withType(JavaCompile).configureEach {
+    it.options.release = 21
+}
+
+java {
+    withSourcesJar()
+    sourceCompatibility = JavaVersion.VERSION_21
+    targetCompatibility = JavaVersion.VERSION_21
+}
+
+jar {
+    from("LICENSE") {
+        rename { "${it}_${project.archives_base_name}" }
+    }
+}

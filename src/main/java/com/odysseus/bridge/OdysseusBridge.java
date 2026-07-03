@@ -2,13 +2,16 @@ package com.odysseus.bridge;
 
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.loader.api.FabricLoader;
+import net.minecraft.client.gui.hud.ChatHud;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.lang.reflect.Method;
+
 public class OdysseusBridge implements ClientModInitializer {
     public static final String MOD_ID   = "odysseus-bridge";
-    public static final String VERSION  = "0.1.2";
+    public static final String VERSION  = "0.1.3";
     public static final String DEFAULT_URL = "ws://127.0.0.1:7860/api/minecraft/copilot_bridge";
 
     public static final Logger LOG = LoggerFactory.getLogger(MOD_ID);
@@ -26,7 +29,20 @@ public class OdysseusBridge implements ClientModInitializer {
         client = new BridgeClient(url);
         client.start();
 
-        LOG.info("Odysseus Bridge {} initialized. Diagnostic build — logs every intercepted chat line.", VERSION);
+        // Prove which methods actually exist on ChatHud at runtime (intermediary names),
+        // and prove whether our mixin injected (odysseus$ methods will appear here).
+        try {
+            Method[] ms = ChatHud.class.getDeclaredMethods();
+            LOG.info("[chatHud-scan] {} declared methods on ChatHud", ms.length);
+            for (Method m : ms) {
+                LOG.info("[chatHud-scan]   {} params={} return={}",
+                    m.getName(), m.getParameterCount(), m.getReturnType().getSimpleName());
+            }
+        } catch (Throwable t) {
+            LOG.warn("[chatHud-scan] failed: {}", t.toString());
+        }
+
+        LOG.info("Odysseus Bridge {} initialized. Shotgun diagnostic build.", VERSION);
     }
 
     public static void onChatMessage(String text) {

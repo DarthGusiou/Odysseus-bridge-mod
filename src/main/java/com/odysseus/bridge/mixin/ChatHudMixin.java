@@ -8,24 +8,27 @@ import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
-/**
- * Hooks every message that lands in the client chat overlay — including
- * client-side-injected ones from Baritone, Meteor, etc. that never touch
- * the server → client receive events Fabric API exposes.
- *
- * Baritone's "[Baritone] Going to..." messages come in via this path;
- * OdysseusBridge decides what to forward.
- */
 @Mixin(ChatHud.class)
 public class ChatHudMixin {
-    @Inject(method = "addMessage(Lnet/minecraft/text/Text;)V", at = @At("HEAD"))
-    private void odysseus$captureAllChat(Text message, CallbackInfo ci) {
+
+    @Inject(method = "addMessage(Lnet/minecraft/text/Text;)V", at = @At("HEAD"), require = 0)
+    private void odysseus$captureAddMessageSingle(Text message, CallbackInfo ci) {
         try {
-            if (message != null) {
-                OdysseusBridge.onChatMessage(message.getString());
-            }
+            OdysseusBridge.LOG.info("[mixin] addMessage(Text) fired");
+            if (message != null) OdysseusBridge.onChatMessage(message.getString());
         } catch (Throwable t) {
-            // never break the chat pipeline
+            OdysseusBridge.LOG.warn("[mixin] error in single-arg", t);
+        }
+    }
+
+    @Inject(method = "logChatMessage(Lnet/minecraft/text/Text;Lnet/minecraft/client/gui/hud/MessageIndicator;)V",
+            at = @At("HEAD"), require = 0)
+    private void odysseus$captureLogChatMessage(Text message, Object indicator, CallbackInfo ci) {
+        try {
+            OdysseusBridge.LOG.info("[mixin] logChatMessage fired");
+            if (message != null) OdysseusBridge.onChatMessage(message.getString());
+        } catch (Throwable t) {
+            OdysseusBridge.LOG.warn("[mixin] error in logChatMessage", t);
         }
     }
 }

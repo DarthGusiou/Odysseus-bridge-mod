@@ -10,11 +10,6 @@ import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
-/**
- * Shotgun mixin — hooks every plausible chat-add entry point in ChatHud.
- * All hooks use require=0 so unknown methods silently no-op instead of
- * failing the whole mixin config.
- */
 @Mixin(ChatHud.class)
 public class ChatHudMixin {
 
@@ -40,14 +35,6 @@ public class ChatHudMixin {
             at = @At("HEAD"), require = 0)
     private void odysseus$capture_log(Text message, MessageIndicator ind, CallbackInfo ci) {
         odysseus$log("logChatMessage", message);
-    }
-
-    @Inject(method = "addVisibleMessage(Lnet/minecraft/client/gui/hud/ChatHudLine;)V",
-            at = @At("HEAD"), require = 0)
-    private void odysseus$capture_visible(Object line, CallbackInfo ci) {
-        try {
-            OdysseusBridge.LOG.info("[mixin] addVisibleMessage fired (line={})", line);
-        } catch (Throwable t) { }
     }
 
     private void odysseus$log(String via, Text message) {

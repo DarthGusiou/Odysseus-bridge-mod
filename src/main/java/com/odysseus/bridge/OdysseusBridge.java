@@ -6,21 +6,9 @@ import net.fabricmc.loader.api.FabricLoader;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-/**
- * Odysseus Bridge — client-side Fabric addon.
- *
- * On launch, opens a WebSocket to the local Odysseus server. Commands
- * from Odysseus get dispatched to Baritone directly (via reflection —
- * no Baritone compile dep). Chat messages are captured via ChatHudMixin
- * (Baritone injects into the chat HUD directly, bypassing Fabric API's
- * ClientReceiveMessageEvents), classified, and forwarded to Odysseus.
- *
- * Zero server chat traffic — everything happens on your machine.
- */
 public class OdysseusBridge implements ClientModInitializer {
     public static final String MOD_ID   = "odysseus-bridge";
-    public static final String VERSION  = "0.1.0";
-    // Where Odysseus is listening. Override with env ODYSSEUS_BRIDGE_URL.
+    public static final String VERSION  = "0.1.2";
     public static final String DEFAULT_URL = "ws://127.0.0.1:7860/api/minecraft/copilot_bridge";
 
     public static final Logger LOG = LoggerFactory.getLogger(MOD_ID);
@@ -38,13 +26,16 @@ public class OdysseusBridge implements ClientModInitializer {
         client = new BridgeClient(url);
         client.start();
 
-        LOG.info("Odysseus Bridge initialized. Chat interception via ChatHud mixin.");
+        LOG.info("Odysseus Bridge {} initialized. Diagnostic build — logs every intercepted chat line.", VERSION);
     }
 
-    /** Called from ChatHudMixin for every message the chat overlay renders. */
     public static void onChatMessage(String text) {
-        if (text == null || text.isEmpty() || client == null) return;
-        if (!text.contains("Baritone")) return;
+        if (text == null) { LOG.info("[chat] null"); return; }
+        LOG.info("[chat] raw=«{}»", text);
+        if (text.isEmpty() || client == null) return;
+        boolean isBaritone = text.contains("Baritone") || text.contains("baritone");
+        if (!isBaritone) return;
+        LOG.info("[chat] forwarding Baritone message");
         String stripped = text;
         if (text.startsWith("[")) {
             int close = text.indexOf(']');
@@ -56,7 +47,6 @@ public class OdysseusBridge implements ClientModInitializer {
         client.sendEvent(event, stripped);
     }
 
-    /** Rough classifier so Odysseus can color the copilot_status event. */
     private static String classifyBaritoneMessage(String text) {
         String low = text.toLowerCase();
         if (low.contains("goal reached") || low.contains("arrived") || low.contains("done"))

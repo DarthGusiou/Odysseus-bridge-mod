@@ -1,13 +1,13 @@
 // build.gradle — Odysseus Bridge addon
 //
-// Fabric mod that runs alongside a Baritone build (any Fabric Baritone fork
-// with the standard baritone.api.BaritoneAPI classpath). Connects to
-// Odysseus via a local WebSocket; commands are dispatched to Baritone
-// via reflection so we don't need a compile-time Baritone dependency.
-// Chat status is captured via Fabric API's ClientReceiveMessageEvents.
+// Fabric mod that runs alongside Baritone (cabaletta/baritone Fabric build,
+// baritone-api-fabric-1.15.0.jar for 1.21.6-1.21.8). Connects to Odysseus
+// via a local WebSocket; commands are dispatched to Baritone via reflection
+// (no compile-time Baritone dependency). Chat status is captured via
+// Fabric API's ClientReceiveMessageEvents.
 
 plugins {
-    id 'fabric-loom' version '1.17.13'
+    id 'fabric-loom' version '1.10-SNAPSHOT'
     id 'java'
 }
 
@@ -23,7 +23,7 @@ repositories {
 
 dependencies {
     minecraft "com.mojang:minecraft:${project.minecraft_version}"
-    mappings loom.officialMojangMappings()
+    mappings  "net.fabricmc:yarn:${project.yarn_mappings}:v2"
     modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
     modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
 
@@ -38,13 +38,13 @@ processResources {
 }
 
 tasks.withType(JavaCompile).configureEach {
-    it.options.release = 25
+    it.options.release = 21
 }
 
 java {
     withSourcesJar()
-    sourceCompatibility = JavaVersion.VERSION_25
-    targetCompatibility = JavaVersion.VERSION_25
+    sourceCompatibility = JavaVersion.VERSION_21
+    targetCompatibility = JavaVersion.VERSION_21
 }
 
 jar {

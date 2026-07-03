@@ -17,18 +17,18 @@ jobs:
           distribution: 'temurin'
           java-version: '25'
 
-      - name: Set up Gradle
+           - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: '8.14'
+          gradle-version: '9.0.0'
 
       - name: Generate Gradle wrapper (if missing)
         run: |
           if [ ! -f gradlew ]; then
-            gradle wrapper --gradle-version 8.14
+            gradle wrapper --gradle-version 9.0.0
           fi
           chmod +x gradlew
-
+          
       - name: Show environment
         run: |
           java -version

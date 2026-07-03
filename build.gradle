@@ -3,7 +3,7 @@
 // and connects to Odysseus via a local WebSocket.
 
 plugins {
-    id 'fabric-loom' version '1.10-SNAPSHOT'
+    id 'fabric-loom' version '1.17.13'
     id 'java'
 }
 

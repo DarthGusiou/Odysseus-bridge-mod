@@ -1,46 +1,55 @@
 package com.odysseus.bridge;
 
-import baritone.api.BaritoneAPI;
-import baritone.api.command.manager.ICommandManager;
 import net.minecraft.client.MinecraftClient;
+import java.lang.reflect.Method;
 
 /**
- * Runs Baritone commands as if the local user had typed them, but WITHOUT
- * routing through the game's chat system. Uses Baritone's programmatic
- * ICommandManager so nothing appears in server chat.
+ * Runs Baritone commands without a compile-time dependency on Baritone.
+ * Uses reflection so a single jar works with any Fabric Baritone fork
+ * (Baritone-Meteor, Cabaletta upstream, etc.) as long as
+ * `baritone.api.BaritoneAPI` is on the classpath at runtime.
  *
- * If a build ever finds this API missing, the fallback path (commented
- * inline) calls Baritone via the client's chat-command-processor with a
- * silent flag — that requires slightly newer Baritone but avoids any
- * server round-trip either way.
+ * Nothing goes through server chat — the command is dispatched directly
+ * to Baritone's ICommandManager on the main thread.
  */
 public class BaritoneDispatcher {
 
     /** Execute a Baritone command string, e.g. "goto 100 64 -50" or "stop". */
     public static void execute(String command) {
         if (command == null || command.isBlank()) return;
-        // Baritone commands can arrive with or without a leading `#`.
-        String trimmed = command.trim();
-        if (trimmed.startsWith("#")) trimmed = trimmed.substring(1);
+        String cmd = command.trim();
+        if (cmd.startsWith("#")) cmd = cmd.substring(1);
 
         MinecraftClient mc = MinecraftClient.getInstance();
         if (mc == null) {
-            OdysseusBridge.LOG.warn("Dropped Baritone cmd — MC not initialized: {}", trimmed);
+            OdysseusBridge.LOG.warn("Dropped Baritone cmd — MC not initialized: {}", cmd);
             return;
         }
 
-        String finalCmd = trimmed;
-        // Execute on the main client thread; Baritone requires that.
+        final String finalCmd = cmd;
         mc.execute(() -> {
             try {
-                ICommandManager mgr = BaritoneAPI.getProvider()
-                        .getPrimaryBaritone()
-                        .getCommandManager();
-                boolean ok = mgr.execute(finalCmd);
-                OdysseusBridge.LOG.info("Baritone.execute({}) -> {}", finalCmd, ok);
+                Class<?> apiClass    = Class.forName("baritone.api.BaritoneAPI");
+                Object   provider    = apiClass.getMethod("getProvider").invoke(null);
+                Object   primary     = provider.getClass().getMethod("getPrimaryBaritone").invoke(provider);
+                Object   cmdManager  = primary.getClass().getMethod("getCommandManager").invoke(primary);
+                Method   execute     = findExecuteMethod(cmdManager.getClass());
+                Object   result      = execute.invoke(cmdManager, finalCmd);
+                OdysseusBridge.LOG.info("Baritone.execute({}) -> {}", finalCmd, result);
+            } catch (ClassNotFoundException notFound) {
+                OdysseusBridge.LOG.warn("Baritone not on classpath — is a Baritone Fabric mod installed?");
             } catch (Throwable t) {
-                OdysseusBridge.LOG.warn("Baritone command failed [{}]: {}", finalCmd, t.getMessage());
+                OdysseusBridge.LOG.warn("Baritone command failed [{}]: {}", finalCmd, t.toString());
             }
         });
+    }
+
+    private static Method findExecuteMethod(Class<?> mgrClass) throws NoSuchMethodException {
+        for (Method m : mgrClass.getMethods()) {
+            if (!"execute".equals(m.getName())) continue;
+            Class<?>[] p = m.getParameterTypes();
+            if (p.length == 1 && p[0] == String.class) return m;
+        }
+        throw new NoSuchMethodException("No execute(String) on " + mgrClass.getName());
     }
 }

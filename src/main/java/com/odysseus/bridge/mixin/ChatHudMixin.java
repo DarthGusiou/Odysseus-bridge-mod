@@ -13,36 +13,23 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 @Mixin(ChatHud.class)
 public class ChatHudMixin {
 
-    @Inject(method = "addMessage(Lnet/minecraft/text/Text;)V",
-            at = @At("HEAD"), require = 0)
-    private void odysseus$capture_1(Text message, CallbackInfo ci) {
-        odysseus$log("addMessage(Text)", message);
-    }
-
     @Inject(method = "addMessage(Lnet/minecraft/text/Text;Lnet/minecraft/network/message/MessageSignatureData;Lnet/minecraft/client/gui/hud/MessageIndicator;)V",
             at = @At("HEAD"), require = 0)
-    private void odysseus$capture_3(Text message, MessageSignatureData sig, MessageIndicator ind, CallbackInfo ci) {
-        odysseus$log("addMessage(Text,SigData,Indicator)", message);
-    }
-
-    @Inject(method = "addMessage(Lnet/minecraft/text/Text;Lnet/minecraft/network/message/MessageSignatureData;ILnet/minecraft/client/gui/hud/MessageIndicator;Z)V",
-            at = @At("HEAD"), require = 0)
-    private void odysseus$capture_5(Text message, MessageSignatureData sig, int ticks, MessageIndicator ind, boolean refresh, CallbackInfo ci) {
-        odysseus$log("addMessage(5arg)", message);
-    }
-
-    @Inject(method = "logChatMessage(Lnet/minecraft/text/Text;Lnet/minecraft/client/gui/hud/MessageIndicator;)V",
-            at = @At("HEAD"), require = 0)
-    private void odysseus$capture_log(Text message, MessageIndicator ind, CallbackInfo ci) {
-        odysseus$log("logChatMessage", message);
-    }
-
-    private void odysseus$log(String via, Text message) {
+    private void odysseus$captureChat3(Text message, MessageSignatureData sig, MessageIndicator ind, CallbackInfo ci) {
         try {
-            OdysseusBridge.LOG.info("[mixin] {} fired", via);
             if (message != null) OdysseusBridge.onChatMessage(message.getString());
         } catch (Throwable t) {
-            OdysseusBridge.LOG.warn("[mixin] err {}: {}", via, t.toString());
+            OdysseusBridge.LOG.warn("[mixin] err3: {}", t.toString());
+        }
+    }
+
+    @Inject(method = "addMessage(Lnet/minecraft/text/Text;)V",
+            at = @At("HEAD"), require = 0)
+    private void odysseus$captureChat1(Text message, CallbackInfo ci) {
+        try {
+            if (message != null) OdysseusBridge.onChatMessage(message.getString());
+        } catch (Throwable t) {
+            OdysseusBridge.LOG.warn("[mixin] err1: {}", t.toString());
         }
     }
 }

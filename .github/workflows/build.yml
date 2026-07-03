@@ -1,0 +1,63 @@
+name: Build
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.10.2'
+
+      - name: Generate Gradle wrapper (if missing)
+        run: |
+          if [ ! -f gradlew ]; then
+            gradle wrapper --gradle-version 8.10.2
+          fi
+          chmod +x gradlew
+
+      - name: Show environment
+        run: |
+          java -version
+          ./gradlew --version || gradle --version
+          echo "MC version pin: $(grep minecraft_version gradle.properties)"
+
+      - name: Build
+        run: ./gradlew build --stacktrace --no-daemon
+        continue-on-error: true
+        id: buildstep
+
+      - name: Upload build reports on failure
+        if: steps.buildstep.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-reports
+          path: build/reports/
+          if-no-files-found: warn
+
+      - name: Fail if build failed
+        if: steps.buildstep.outcome == 'failure'
+        run: |
+          echo "::error::Build failed. Check the logs above and the uploaded build-reports artifact for dependency resolution errors — likely the MC 26.1 mapping/API/Baritone versions in gradle.properties need adjustment."
+          exit 1
+
+      - name: Upload jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: odysseus-bridge-jar
+          path: build/libs/*.jar
+          if-no-files-found: error
+          retention-days: 30

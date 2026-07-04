@@ -27,21 +27,10 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 
-/**
- * Custom Odysseus commands — crafting, chest interaction, item use.
- * Runs a single ticking task at a time via ClientTickEvents so multi-step
- * ops (open menu → click recipe → take output → close) can span ticks
- * without blocking the render thread.
- *
- * Recipe iteration + clickRecipe use reflection — the Minecraft recipe
- * API changed shape in 1.21.5+ (RecipeManager.values gone, clickRecipe
- * now takes NetworkRecipeId, Recipe.getResult refactored) and reflection
- * keeps this working across future changes without version pinning.
- */
 public class OdysseusDispatcher {
     private static volatile Task currentTask;
+    private static boolean debugDumped = false;
 
-    /** Register the tick pump. Called once from OdysseusBridge.onInitializeClient. */
     public static void register() {
         ClientTickEvents.END_CLIENT_TICK.register(OdysseusDispatcher::onTick);
     }
@@ -50,9 +39,7 @@ public class OdysseusDispatcher {
         Task task = currentTask;
         if (task == null) return;
         try {
-            if (task.tick(client)) {
-                currentTask = null;
-            }
+            if (task.tick(client)) currentTask = null;
         } catch (Throwable t) {
             OdysseusBridge.LOG.warn("[odysseus] task crashed: {}", t.toString());
             emit("error", task.name() + " crashed: " + t.getMessage());
@@ -60,7 +47,6 @@ public class OdysseusDispatcher {
         }
     }
 
-    /** Parse and dispatch a raw "!command args" string. */
     public static void execute(String rawCmd, BridgeClient client) {
         if (rawCmd == null || rawCmd.isBlank()) return;
         String cmd = rawCmd.trim();
@@ -74,10 +60,7 @@ public class OdysseusDispatcher {
         }
         switch (verb) {
             case "craft":
-                if (parts.length < 2) {
-                    emit("craft_failed", "Usage: !craft <item> [count]");
-                    return;
-                }
+                if (parts.length < 2) { emit("craft_failed", "Usage: !craft <item> [count]"); return; }
                 String item = parts[1];
                 int count = parts.length >= 3 ? parseIntOr(parts[2], 1) : 1;
                 currentTask = new CraftTask(item, count);
@@ -85,17 +68,59 @@ public class OdysseusDispatcher {
             case "use":
                 currentTask = new UseHeldTask();
                 return;
+            case "debug_recipes":
+                currentTask = new DebugRecipesTask();
+                return;
             default:
                 emit("unknown_command", "Unknown Odysseus command: !" + verb);
         }
     }
 
-    // ── Task API ──────────────────────────────────────────────────────────
-
     interface Task {
-        /** Returns true when the task is finished. */
         boolean tick(MinecraftClient client);
         String name();
+    }
+
+    // ── Debug task: dump methods on the recipe classes so we know what to call ──
+
+    private static class DebugRecipesTask implements Task {
+        @Override public String name() { return "debug recipes"; }
+        @Override
+        public boolean tick(MinecraftClient client) {
+            ClientPlayerEntity player = client.player;
+            World world = client.world;
+            if (player == null || world == null) {
+                emit("error", "no player/world");
+                return true;
+            }
+            Object rm = world.getRecipeManager();
+            dumpClassMethods(rm, "RecipeManager");
+            try {
+                Object book = player.getRecipeBook();
+                if (book != null) dumpClassMethods(book, "ClientRecipeBook");
+            } catch (Throwable t) {
+                OdysseusBridge.LOG.info("[odysseus-debug] no recipe book: {}", t.toString());
+            }
+            emit("use_ok", "Recipe classes dumped to MC log — grep for [odysseus-debug]");
+            return true;
+        }
+    }
+
+    private static void dumpClassMethods(Object obj, String label) {
+        if (obj == null) return;
+        Class<?> cls = obj.getClass();
+        OdysseusBridge.LOG.info("[odysseus-debug] {} class={} methods:", label, cls.getName());
+        for (Method m : cls.getMethods()) {
+            StringBuilder sb = new StringBuilder("  ");
+            sb.append(m.getName()).append("(");
+            Class<?>[] p = m.getParameterTypes();
+            for (int i = 0; i < p.length; i++) {
+                if (i > 0) sb.append(", ");
+                sb.append(p[i].getSimpleName());
+            }
+            sb.append(") → ").append(m.getReturnType().getSimpleName());
+            OdysseusBridge.LOG.info("[odysseus-debug] {}", sb.toString());
+        }
     }
 
     // ── Craft task ────────────────────────────────────────────────────────
@@ -108,7 +133,7 @@ public class OdysseusDispatcher {
         private int ticksInState = 0;
         private int initialInventoryCount = -1;
         private int lastKnownCount = -1;
-        private Object recipeEntry;   // opaque — accessed via reflection
+        private Object recipeEntry;
 
         enum State { FIND_TABLE, WAIT_SCREEN, CLICK_RECIPE, WAIT_FILL, TAKE_OUTPUT, WAIT_TAKE, CHECK_COUNT, CLOSE, DONE }
 
@@ -126,84 +151,78 @@ public class OdysseusDispatcher {
             if (player == null || world == null) return false;
             ticksInState++;
             switch (state) {
-                case FIND_TABLE:      return doFindTable(client, player, world);
-                case WAIT_SCREEN:     return doWaitScreen(client, player);
-                case CLICK_RECIPE:    return doClickRecipe(client, player, world);
-                case WAIT_FILL:       return doWaitFill(client, player);
-                case TAKE_OUTPUT:     return doTakeOutput(client, player);
-                case WAIT_TAKE:       return doWaitTake(client, player);
-                case CHECK_COUNT:     return doCheckCount(client, player);
-                case CLOSE:           return doClose(client, player);
-                case DONE:            return true;
+                case FIND_TABLE:   return doFindTable(client, player, world);
+                case WAIT_SCREEN:  return doWaitScreen(client, player);
+                case CLICK_RECIPE: return doClickRecipe(client, player, world);
+                case WAIT_FILL:    return doWaitFill(client, player);
+                case TAKE_OUTPUT:  return doTakeOutput(client, player);
+                case WAIT_TAKE:    return doWaitTake(client, player);
+                case CHECK_COUNT:  return doCheckCount(client, player);
+                case CLOSE:        return doClose(client, player);
+                case DONE:         return true;
             }
             return true;
         }
 
-        private void enter(State next) {
-            this.state = next;
-            this.ticksInState = 0;
-        }
+        private void enter(State next) { this.state = next; this.ticksInState = 0; }
 
         private boolean doFindTable(MinecraftClient client, ClientPlayerEntity player, World world) {
             if (player.currentScreenHandler instanceof CraftingScreenHandler) {
-                enter(State.CLICK_RECIPE);
-                return false;
+                enter(State.CLICK_RECIPE); return false;
             }
             BlockPos here = player.getBlockPos();
             BlockPos found = null;
             outer:
-            for (int dy = -1; dy <= 2; dy++) {
-                for (int dx = -3; dx <= 3; dx++) {
+            for (int dy = -1; dy <= 2; dy++)
+                for (int dx = -3; dx <= 3; dx++)
                     for (int dz = -3; dz <= 3; dz++) {
                         BlockPos p = here.add(dx, dy, dz);
-                        if (world.getBlockState(p).getBlock() == Blocks.CRAFTING_TABLE) {
-                            found = p;
-                            break outer;
-                        }
+                        if (world.getBlockState(p).getBlock() == Blocks.CRAFTING_TABLE) { found = p; break outer; }
                     }
-                }
-            }
             if (found == null) {
                 emit("craft_failed", "No crafting_table within 3 blocks — walk to one first (#goto crafting_table).");
-                enter(State.DONE);
-                return true;
+                enter(State.DONE); return true;
             }
             Vec3d hitVec = Vec3d.ofCenter(found);
             BlockHitResult hit = new BlockHitResult(hitVec, Direction.UP, found, false);
             ClientPlayerInteractionManager im = client.interactionManager;
-            if (im != null) {
-                im.interactBlock(player, Hand.MAIN_HAND, hit);
-            }
+            if (im != null) im.interactBlock(player, Hand.MAIN_HAND, hit);
             enter(State.WAIT_SCREEN);
             return false;
         }
 
         private boolean doWaitScreen(MinecraftClient client, ClientPlayerEntity player) {
             if (player.currentScreenHandler instanceof CraftingScreenHandler) {
-                enter(State.CLICK_RECIPE);
-                return false;
+                enter(State.CLICK_RECIPE); return false;
             }
             if (ticksInState > 40) {
                 emit("craft_failed", "Timed out waiting for crafting screen to open.");
-                enter(State.CLOSE);
-                return false;
+                enter(State.CLOSE); return false;
             }
             return false;
         }
 
         private boolean doClickRecipe(MinecraftClient client, ClientPlayerEntity player, World world) {
             if (recipeEntry == null) {
+                // First-time debug: dump recipe class methods so we can adapt.
+                if (!debugDumped) {
+                    debugDumped = true;
+                    dumpClassMethods(world.getRecipeManager(), "RecipeManager");
+                    try {
+                        Object book = player.getRecipeBook();
+                        if (book != null) dumpClassMethods(book, "ClientRecipeBook");
+                    } catch (Throwable ignore) {}
+                }
                 Item target = itemFromId(targetItemId);
                 if (target == null) {
                     emit("craft_failed", "Unknown item id: " + targetItemId);
-                    enter(State.CLOSE);
-                    return false;
+                    enter(State.CLOSE); return false;
                 }
-                Optional<Object> pick = findRecipeEntryForOutput(world, target);
+                Optional<Object> pick = findRecipeEntryForOutput(player, world, target);
                 if (pick.isEmpty()) {
-                    emit("craft_failed", "No recipe found that produces " + targetItemId);
-                    enter(State.CLOSE);
-                    return false;
+                    emit("craft_failed", "No recipe found that produces " + targetItemId
+                        + " — run !debug_recipes and paste the log so I can fix the reflection.");
+                    enter(State.CLOSE); return false;
                 }
                 recipeEntry = pick.get();
                 initialInventoryCount = countInInventory(player, target);
@@ -212,24 +231,19 @@ public class OdysseusDispatcher {
             ScreenHandler h = player.currentScreenHandler;
             ClientPlayerInteractionManager im = client.interactionManager;
             if (im == null) {
-                emit("craft_failed", "No interaction manager (client offline?).");
-                enter(State.CLOSE);
-                return false;
+                emit("craft_failed", "No interaction manager."); enter(State.CLOSE); return false;
             }
-            boolean ok = tryClickRecipe(im, h.syncId, recipeEntry, /*craftAll=*/true);
+            boolean ok = tryClickRecipe(im, h.syncId, recipeEntry, true);
             if (!ok) {
-                emit("craft_failed", "Failed to invoke clickRecipe (API mismatch — please report).");
-                enter(State.CLOSE);
-                return false;
+                emit("craft_failed", "clickRecipe reflection failed — see [odysseus] log.");
+                enter(State.CLOSE); return false;
             }
             enter(State.WAIT_FILL);
             return false;
         }
 
         private boolean doWaitFill(MinecraftClient client, ClientPlayerEntity player) {
-            if (ticksInState >= 2) {
-                enter(State.TAKE_OUTPUT);
-            }
+            if (ticksInState >= 2) enter(State.TAKE_OUTPUT);
             return false;
         }
 
@@ -237,36 +251,24 @@ public class OdysseusDispatcher {
             ScreenHandler h = player.currentScreenHandler;
             if (!(h instanceof CraftingScreenHandler)) {
                 emit("craft_failed", "Crafting screen closed unexpectedly.");
-                enter(State.DONE);
-                return true;
+                enter(State.DONE); return true;
             }
             ItemStack outputStack = h.slots.get(0).getStack();
             if (outputStack.isEmpty()) {
                 int haveNow = countInInventory(player, itemFromId(targetItemId));
                 int delta = haveNow - initialInventoryCount;
-                if (delta > 0) {
-                    emit("craft_ok",
-                        "Crafted " + delta + " " + targetItemId
-                            + " (inventory now: " + haveNow + ")");
-                } else {
-                    emit("craft_failed",
-                        "Grid empty — likely missing ingredients for " + targetItemId);
-                }
-                enter(State.CLOSE);
-                return false;
+                if (delta > 0) emit("craft_ok", "Crafted " + delta + " " + targetItemId + " (inventory now: " + haveNow + ")");
+                else emit("craft_failed", "Grid empty — likely missing ingredients for " + targetItemId);
+                enter(State.CLOSE); return false;
             }
             ClientPlayerInteractionManager im = client.interactionManager;
-            if (im != null) {
-                im.clickSlot(h.syncId, 0, 0, SlotActionType.QUICK_MOVE, player);
-            }
+            if (im != null) im.clickSlot(h.syncId, 0, 0, SlotActionType.QUICK_MOVE, player);
             enter(State.WAIT_TAKE);
             return false;
         }
 
         private boolean doWaitTake(MinecraftClient client, ClientPlayerEntity player) {
-            if (ticksInState >= 2) {
-                enter(State.CHECK_COUNT);
-            }
+            if (ticksInState >= 2) enter(State.CHECK_COUNT);
             return false;
         }
 
@@ -275,33 +277,38 @@ public class OdysseusDispatcher {
             int haveNow = countInInventory(player, target);
             int crafted = haveNow - initialInventoryCount;
             if (crafted >= targetCount) {
-                emit("craft_ok",
-                    "Crafted " + crafted + " " + targetItemId
-                        + " (target " + targetCount + ", inventory " + haveNow + ")");
-                enter(State.CLOSE);
-                return false;
+                emit("craft_ok", "Crafted " + crafted + " " + targetItemId + " (target " + targetCount + ", inventory " + haveNow + ")");
+                enter(State.CLOSE); return false;
             }
             if (haveNow == lastKnownCount) {
-                emit("craft_failed",
-                    "Stopped at " + crafted + "/" + targetCount + " — no more ingredients for " + targetItemId);
-                enter(State.CLOSE);
-                return false;
+                emit("craft_failed", "Stopped at " + crafted + "/" + targetCount + " — no more ingredients for " + targetItemId);
+                enter(State.CLOSE); return false;
             }
             lastKnownCount = haveNow;
             enter(State.TAKE_OUTPUT);
             return false;
         }
 
+        /** Close in a way that doesn't fire the pause-menu code path. */
         private boolean doClose(MinecraftClient client, ClientPlayerEntity player) {
-            if (player.currentScreenHandler != player.playerScreenHandler) {
-                player.closeHandledScreen();
-            }
+            // Directly clear the client screen — avoids the ESC-key-simulation path
+            // that closeHandledScreen() seems to hit in 1.21.8 which triggers pause menu.
+            client.execute(() -> {
+                if (client.player != null && client.player.currentScreenHandler != client.player.playerScreenHandler) {
+                    // Send the close packet to the server ourselves...
+                    try {
+                        client.player.closeHandledScreen();
+                    } catch (Throwable ignore) {}
+                }
+                // ...then force the client screen away so no game-menu code runs.
+                client.setScreen(null);
+            });
             enter(State.DONE);
             return true;
         }
     }
 
-    // ── Use held item task (right-click) ──────────────────────────────────
+    // ── Use held item ─────────────────────────────────────────────────────
 
     private static class UseHeldTask implements Task {
         @Override public String name() { return "use held item"; }
@@ -318,19 +325,51 @@ public class OdysseusDispatcher {
         }
     }
 
-    // ── Reflection helpers for recipe API (changes every MC bump) ─────────
+    // ── Recipe reflection — tries RecipeManager AND ClientRecipeBook ──────
 
-    /** Iterate the client's known recipes. Tries multiple method names since
-     *  the RecipeManager API shifts between MC versions. */
+    /** Try RecipeManager methods, then ClientRecipeBook methods, then dig into
+     *  ClientRecipeBook's RecipeResultCollection groups. Returns first match. */
+    private static Optional<Object> findRecipeEntryForOutput(ClientPlayerEntity player, World world, Item output) {
+        // Path A: RecipeManager direct iteration (works on older API).
+        for (Object entry : allEntriesFromRecipeManager(world.getRecipeManager())) {
+            try {
+                ItemStack result = recipeResult(entry, world);
+                if (result != null && !result.isEmpty() && result.getItem() == output) {
+                    OdysseusBridge.LOG.info("[odysseus] found via RecipeManager: {}", entry);
+                    return Optional.of(entry);
+                }
+            } catch (Throwable ignore) {}
+        }
+        // Path B: ClientRecipeBook — iterate result collections and their entries.
+        try {
+            Object book = player.getRecipeBook();
+            if (book != null) {
+                for (Object entry : allEntriesFromRecipeBook(book)) {
+                    try {
+                        ItemStack result = recipeResult(entry, world);
+                        if (result != null && !result.isEmpty() && result.getItem() == output) {
+                            OdysseusBridge.LOG.info("[odysseus] found via RecipeBook: {}", entry);
+                            return Optional.of(entry);
+                        }
+                    } catch (Throwable ignore) {}
+                }
+            }
+        } catch (Throwable t) {
+            OdysseusBridge.LOG.warn("[odysseus] recipe book scan failed: {}", t.toString());
+        }
+        OdysseusBridge.LOG.info("[odysseus] no recipe found for {} — book scan returned nothing", output);
+        return Optional.empty();
+    }
+
     @SuppressWarnings("unchecked")
-    private static Iterable<Object> allRecipeEntries(Object recipeManager) {
-        if (recipeManager == null) return List.of();
-        Class<?> cls = recipeManager.getClass();
+    private static Iterable<Object> allEntriesFromRecipeManager(Object rm) {
+        if (rm == null) return List.of();
+        Class<?> cls = rm.getClass();
         for (String name : new String[]{"values", "recipes", "getRecipes", "getAllRecipes"}) {
             Method m = findNoArgMethod(cls, name);
             if (m == null) continue;
             try {
-                Object r = m.invoke(recipeManager);
+                Object r = m.invoke(rm);
                 if (r instanceof Iterable) return (Iterable<Object>) r;
                 if (r instanceof Map) return ((Map<Object, Object>) r).values();
                 if (r instanceof Collection) return (Collection<Object>) r;
@@ -339,31 +378,69 @@ public class OdysseusDispatcher {
         return List.of();
     }
 
-    /** Extract the result ItemStack from a Recipe object without knowing the exact
-     *  API. Tries a handful of getter names with and without a registry-lookup arg. */
-    private static ItemStack recipeResult(Object recipeEntry, World world) {
-        Object recipe = unwrapRecipe(recipeEntry);
+    /** Iterate ClientRecipeBook.getOrderedResults() (or equivalent) and flatten
+     *  every RecipeDisplayEntry within. */
+    @SuppressWarnings("unchecked")
+    private static Iterable<Object> allEntriesFromRecipeBook(Object book) {
+        List<Object> out = new ArrayList<>();
+        if (book == null) return out;
+        Class<?> cls = book.getClass();
+        // Find any method returning a List of collections.
+        Object collections = null;
+        for (String name : new String[]{"getOrderedResults", "getResults", "results",
+                                        "getKeyedResults", "getAllCollections"}) {
+            Method m = findNoArgMethod(cls, name);
+            if (m == null) continue;
+            try {
+                Object r = m.invoke(book);
+                if (r instanceof Iterable) { collections = r; break; }
+                if (r instanceof Map) { collections = ((Map<Object, Object>) r).values(); break; }
+            } catch (Throwable ignore) {}
+        }
+        if (collections == null) return out;
+        for (Object collection : (Iterable<Object>) collections) {
+            Class<?> ccls = collection.getClass();
+            for (String innerName : new String[]{"getAllResults", "getResults", "results"}) {
+                Method innerM = null;
+                // getResults may take a boolean; findNoArgMethod won't find it. Also try 1-arg.
+                for (Method cand : ccls.getMethods()) {
+                    if (!cand.getName().equals(innerName)) continue;
+                    if (cand.getParameterCount() == 0) { innerM = cand; break; }
+                }
+                if (innerM != null) {
+                    try {
+                        Object entries = innerM.invoke(collection);
+                        if (entries instanceof Iterable) {
+                            for (Object e : (Iterable<Object>) entries) out.add(e);
+                        }
+                    } catch (Throwable ignore) {}
+                }
+            }
+        }
+        return out;
+    }
+
+    private static ItemStack recipeResult(Object entry, World world) {
+        if (entry == null) return null;
+        Object recipe = unwrapRecipe(entry);
         if (recipe == null) return null;
         Object regMgr = world.getRegistryManager();
         Class<?> cls = recipe.getClass();
         for (String name : new String[]{"getResult", "result", "getResultStack",
                                         "getOutput", "output", "getResultItem"}) {
-            // Try no-arg
-            Method m = findNoArgMethod(cls, name);
-            if (m != null) {
+            Method noArg = findNoArgMethod(cls, name);
+            if (noArg != null) {
                 try {
-                    Object r = m.invoke(recipe);
+                    Object r = noArg.invoke(recipe);
                     if (r instanceof ItemStack) return (ItemStack) r;
                 } catch (Throwable ignore) {}
             }
-            // Try single-arg variants
-            for (Method candidate : cls.getMethods()) {
-                if (!candidate.getName().equals(name)) continue;
-                if (candidate.getParameterCount() != 1) continue;
-                Class<?> paramType = candidate.getParameterTypes()[0];
-                if (!paramType.isInstance(regMgr)) continue;
+            for (Method cand : cls.getMethods()) {
+                if (!cand.getName().equals(name)) continue;
+                if (cand.getParameterCount() != 1) continue;
+                if (!cand.getParameterTypes()[0].isInstance(regMgr)) continue;
                 try {
-                    Object r = candidate.invoke(recipe, regMgr);
+                    Object r = cand.invoke(recipe, regMgr);
                     if (r instanceof ItemStack) return (ItemStack) r;
                 } catch (Throwable ignore) {}
             }
@@ -371,20 +448,16 @@ public class OdysseusDispatcher {
         return null;
     }
 
-    /** Given a RecipeEntry, return the underlying Recipe (via .value() or similar). */
     private static Object unwrapRecipe(Object entry) {
         if (entry == null) return null;
-        Class<?> cls = entry.getClass();
-        for (String name : new String[]{"value", "recipe", "getRecipe"}) {
-            Method m = findNoArgMethod(cls, name);
+        for (String name : new String[]{"value", "recipe", "getRecipe", "display"}) {
+            Method m = findNoArgMethod(entry.getClass(), name);
             if (m == null) continue;
-            try { return m.invoke(entry); } catch (Throwable ignore) {}
+            try { Object r = m.invoke(entry); if (r != null) return r; } catch (Throwable ignore) {}
         }
-        return entry;  // maybe it IS the recipe
+        return entry;
     }
 
-    /** Get NetworkRecipeId (or Identifier — API-dependent) for a recipe entry.
-     *  This is what clickRecipe expects in 1.21.5+. */
     private static Object recipeNetworkId(Object entry) {
         if (entry == null) return null;
         for (String name : new String[]{"id", "networkId", "getId", "getNetworkId"}) {
@@ -395,9 +468,7 @@ public class OdysseusDispatcher {
         return null;
     }
 
-    /** Try every clickRecipe signature we've seen. Returns true if we invoked one. */
-    private static boolean tryClickRecipe(ClientPlayerInteractionManager im,
-                                          int syncId, Object recipeEntry, boolean craftAll) {
+    private static boolean tryClickRecipe(ClientPlayerInteractionManager im, int syncId, Object recipeEntry, boolean craftAll) {
         Object networkId = recipeNetworkId(recipeEntry);
         for (Method m : im.getClass().getMethods()) {
             if (!"clickRecipe".equals(m.getName())) continue;
@@ -405,17 +476,12 @@ public class OdysseusDispatcher {
             if (p.length != 3) continue;
             if (!(p[0] == int.class || p[0] == Integer.class)) continue;
             if (!(p[2] == boolean.class || p[2] == Boolean.class)) continue;
-            // Try passing NetworkRecipeId (new API) or the RecipeEntry directly (old API).
             Object second = null;
             if (networkId != null && p[1].isInstance(networkId)) second = networkId;
             else if (p[1].isInstance(recipeEntry)) second = recipeEntry;
             if (second == null) continue;
-            try {
-                m.invoke(im, syncId, second, craftAll);
-                return true;
-            } catch (Throwable t) {
-                OdysseusBridge.LOG.warn("[odysseus] clickRecipe invoke failed: {}", t.toString());
-            }
+            try { m.invoke(im, syncId, second, craftAll); return true; }
+            catch (Throwable t) { OdysseusBridge.LOG.warn("[odysseus] clickRecipe fail: {}", t.toString()); }
         }
         return false;
     }
@@ -426,24 +492,6 @@ public class OdysseusDispatcher {
         }
         return null;
     }
-
-    /** Find a recipe entry whose output matches the target item. */
-    private static Optional<Object> findRecipeEntryForOutput(World world, Item output) {
-        Object rm = world.getRecipeManager();
-        List<Object> entries = new ArrayList<>();
-        for (Object e : allRecipeEntries(rm)) entries.add(e);
-        for (Object entry : entries) {
-            try {
-                ItemStack result = recipeResult(entry, world);
-                if (result != null && !result.isEmpty() && result.getItem() == output) {
-                    return Optional.of(entry);
-                }
-            } catch (Throwable ignore) {}
-        }
-        return Optional.empty();
-    }
-
-    // ── Misc helpers ──────────────────────────────────────────────────────
 
     private static String normalizeId(String s) {
         s = s.trim().toLowerCase();
@@ -457,9 +505,7 @@ public class OdysseusDispatcher {
             if (ident == null) return null;
             Item item = Registries.ITEM.get(ident);
             return (item == null || item == net.minecraft.item.Items.AIR) ? null : item;
-        } catch (Throwable t) {
-            return null;
-        }
+        } catch (Throwable t) { return null; }
     }
 
     private static int countInInventory(ClientPlayerEntity player, Item item) {

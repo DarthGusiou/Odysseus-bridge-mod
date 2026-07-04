@@ -21,15 +21,11 @@ import net.minecraft.util.math.Vec3d;
 import net.minecraft.world.World;
 
 import java.lang.reflect.Method;
-import java.util.ArrayList;
-import java.util.Collection;
 import java.util.List;
-import java.util.Map;
 import java.util.Optional;
 
 public class OdysseusDispatcher {
     private static volatile Task currentTask;
-    private static boolean debugDumped = false;
 
     public static void register() {
         ClientTickEvents.END_CLIENT_TICK.register(OdysseusDispatcher::onTick);
@@ -81,45 +77,60 @@ public class OdysseusDispatcher {
         String name();
     }
 
-    // ── Debug task: dump methods on the recipe classes so we know what to call ──
+    // ── Debug: dump ClientRecipeBook.method_1393()[0] deeply ──────────────
 
     private static class DebugRecipesTask implements Task {
         @Override public String name() { return "debug recipes"; }
         @Override
         public boolean tick(MinecraftClient client) {
             ClientPlayerEntity player = client.player;
-            World world = client.world;
-            if (player == null || world == null) {
-                emit("error", "no player/world");
+            if (player == null) { emit("error", "no player"); return true; }
+            Object book;
+            try { book = player.getRecipeBook(); } catch (Throwable t) { book = null; }
+            if (book == null) { emit("error", "no recipe book"); return true; }
+            OdysseusBridge.LOG.info("[odysseus-debug] book class: {}", book.getClass().getName());
+            List<?> list = findFirstListReturn(book);
+            if (list == null) {
+                OdysseusBridge.LOG.info("[odysseus-debug] no List-returning no-arg method found on book");
+                emit("use_ok", "No List method on book");
                 return true;
             }
-            Object rm = world.getRecipeManager();
-            dumpClassMethods(rm, "RecipeManager");
-            try {
-                Object book = player.getRecipeBook();
-                if (book != null) dumpClassMethods(book, "ClientRecipeBook");
-            } catch (Throwable t) {
-                OdysseusBridge.LOG.info("[odysseus-debug] no recipe book: {}", t.toString());
+            OdysseusBridge.LOG.info("[odysseus-debug] book list size: {}", list.size());
+            if (list.isEmpty()) { emit("use_ok", "Book list empty"); return true; }
+            Object first = list.get(0);
+            OdysseusBridge.LOG.info("[odysseus-debug] entry[0] class: {}", first.getClass().getName());
+            dumpNoArgMethods(first, "entry[0]");
+            // Recurse into every no-arg method result to see what's inside
+            for (Method m : first.getClass().getMethods()) {
+                if (m.getParameterCount() != 0) continue;
+                if (m.getDeclaringClass() == Object.class) continue;
+                try {
+                    Object sub = m.invoke(first);
+                    if (sub == null) continue;
+                    OdysseusBridge.LOG.info("[odysseus-debug]   entry[0].{}() = {} class={}",
+                        m.getName(),
+                        sub.toString().length() > 80 ? sub.toString().substring(0, 80) + "…" : sub.toString(),
+                        sub.getClass().getName());
+                    if (m.getReturnType().isPrimitive()
+                        || sub instanceof String || sub instanceof Number || sub instanceof Boolean
+                        || sub.getClass().isArray()) continue;
+                    dumpNoArgMethods(sub, "  " + m.getName() + "()→");
+                } catch (Throwable t) {
+                    OdysseusBridge.LOG.info("[odysseus-debug]   entry[0].{}() threw: {}", m.getName(), t.toString());
+                }
             }
-            emit("use_ok", "Recipe classes dumped to MC log — grep for [odysseus-debug]");
+            emit("use_ok", "Deep dump complete — grep MC log for [odysseus-debug]");
             return true;
         }
     }
 
-    private static void dumpClassMethods(Object obj, String label) {
+    private static void dumpNoArgMethods(Object obj, String label) {
         if (obj == null) return;
-        Class<?> cls = obj.getClass();
-        OdysseusBridge.LOG.info("[odysseus-debug] {} class={} methods:", label, cls.getName());
-        for (Method m : cls.getMethods()) {
-            StringBuilder sb = new StringBuilder("  ");
-            sb.append(m.getName()).append("(");
-            Class<?>[] p = m.getParameterTypes();
-            for (int i = 0; i < p.length; i++) {
-                if (i > 0) sb.append(", ");
-                sb.append(p[i].getSimpleName());
-            }
-            sb.append(") → ").append(m.getReturnType().getSimpleName());
-            OdysseusBridge.LOG.info("[odysseus-debug] {}", sb.toString());
+        for (Method m : obj.getClass().getMethods()) {
+            if (m.getParameterCount() != 0) continue;
+            if (m.getDeclaringClass() == Object.class) continue;
+            OdysseusBridge.LOG.info("[odysseus-debug] {}.{}() → {}",
+                label, m.getName(), m.getReturnType().getSimpleName());
         }
     }
 
@@ -204,35 +215,25 @@ public class OdysseusDispatcher {
 
         private boolean doClickRecipe(MinecraftClient client, ClientPlayerEntity player, World world) {
             if (recipeEntry == null) {
-                // First-time debug: dump recipe class methods so we can adapt.
-                if (!debugDumped) {
-                    debugDumped = true;
-                    dumpClassMethods(world.getRecipeManager(), "RecipeManager");
-                    try {
-                        Object book = player.getRecipeBook();
-                        if (book != null) dumpClassMethods(book, "ClientRecipeBook");
-                    } catch (Throwable ignore) {}
-                }
                 Item target = itemFromId(targetItemId);
                 if (target == null) {
                     emit("craft_failed", "Unknown item id: " + targetItemId);
                     enter(State.CLOSE); return false;
                 }
-                Optional<Object> pick = findRecipeEntryForOutput(player, world, target);
+                Optional<Object> pick = findRecipeEntryForOutput(player, target);
                 if (pick.isEmpty()) {
-                    emit("craft_failed", "No recipe found that produces " + targetItemId
-                        + " — run !debug_recipes and paste the log so I can fix the reflection.");
+                    emit("craft_failed", "No recipe entry matched " + targetItemId
+                        + " — try !debug_recipes and paste the log.");
                     enter(State.CLOSE); return false;
                 }
                 recipeEntry = pick.get();
+                OdysseusBridge.LOG.info("[odysseus] using recipe entry: {}", recipeEntry);
                 initialInventoryCount = countInInventory(player, target);
                 lastKnownCount = initialInventoryCount;
             }
             ScreenHandler h = player.currentScreenHandler;
             ClientPlayerInteractionManager im = client.interactionManager;
-            if (im == null) {
-                emit("craft_failed", "No interaction manager."); enter(State.CLOSE); return false;
-            }
+            if (im == null) { emit("craft_failed", "No interaction manager."); enter(State.CLOSE); return false; }
             boolean ok = tryClickRecipe(im, h.syncId, recipeEntry, true);
             if (!ok) {
                 emit("craft_failed", "clickRecipe reflection failed — see [odysseus] log.");
@@ -289,18 +290,11 @@ public class OdysseusDispatcher {
             return false;
         }
 
-        /** Close in a way that doesn't fire the pause-menu code path. */
         private boolean doClose(MinecraftClient client, ClientPlayerEntity player) {
-            // Directly clear the client screen — avoids the ESC-key-simulation path
-            // that closeHandledScreen() seems to hit in 1.21.8 which triggers pause menu.
             client.execute(() -> {
                 if (client.player != null && client.player.currentScreenHandler != client.player.playerScreenHandler) {
-                    // Send the close packet to the server ourselves...
-                    try {
-                        client.player.closeHandledScreen();
-                    } catch (Throwable ignore) {}
+                    try { client.player.closeHandledScreen(); } catch (Throwable ignore) {}
                 }
-                // ...then force the client screen away so no game-menu code runs.
                 client.setScreen(null);
             });
             enter(State.DONE);
@@ -316,8 +310,7 @@ public class OdysseusDispatcher {
         public boolean tick(MinecraftClient client) {
             ClientPlayerEntity player = client.player;
             if (player == null || client.interactionManager == null) {
-                emit("use_failed", "No player/interaction manager.");
-                return true;
+                emit("use_failed", "No player/interaction manager."); return true;
             }
             client.interactionManager.interactItem(player, Hand.MAIN_HAND);
             emit("use_ok", "Used held item.");
@@ -325,173 +318,147 @@ public class OdysseusDispatcher {
         }
     }
 
-    // ── Recipe reflection — tries RecipeManager AND ClientRecipeBook ──────
+    // ── Recipe lookup — RecipeBook only (client RecipeManager is empty in 1.21.6+) ──
 
-    /** Try RecipeManager methods, then ClientRecipeBook methods, then dig into
-     *  ClientRecipeBook's RecipeResultCollection groups. Returns first match. */
-    private static Optional<Object> findRecipeEntryForOutput(ClientPlayerEntity player, World world, Item output) {
-        // Path A: RecipeManager direct iteration (works on older API).
-        for (Object entry : allEntriesFromRecipeManager(world.getRecipeManager())) {
-            try {
-                ItemStack result = recipeResult(entry, world);
-                if (result != null && !result.isEmpty() && result.getItem() == output) {
-                    OdysseusBridge.LOG.info("[odysseus] found via RecipeManager: {}", entry);
-                    return Optional.of(entry);
-                }
-            } catch (Throwable ignore) {}
+    private static Optional<Object> findRecipeEntryForOutput(ClientPlayerEntity player, Item output) {
+        Object book;
+        try { book = player.getRecipeBook(); } catch (Throwable t) { return Optional.empty(); }
+        if (book == null) return Optional.empty();
+        List<?> entries = findFirstListReturn(book);
+        if (entries == null || entries.isEmpty()) {
+            OdysseusBridge.LOG.info("[odysseus] recipe book returned empty/no-list");
+            return Optional.empty();
         }
-        // Path B: ClientRecipeBook — iterate result collections and their entries.
-        try {
-            Object book = player.getRecipeBook();
-            if (book != null) {
-                for (Object entry : allEntriesFromRecipeBook(book)) {
-                    try {
-                        ItemStack result = recipeResult(entry, world);
-                        if (result != null && !result.isEmpty() && result.getItem() == output) {
-                            OdysseusBridge.LOG.info("[odysseus] found via RecipeBook: {}", entry);
-                            return Optional.of(entry);
-                        }
-                    } catch (Throwable ignore) {}
-                }
+        OdysseusBridge.LOG.info("[odysseus] scanning {} recipe entries for {}", entries.size(), output);
+        for (Object entry : entries) {
+            ItemStack result = extractResultStack(entry);
+            if (result != null && !result.isEmpty() && result.getItem() == output) {
+                return Optional.of(entry);
             }
-        } catch (Throwable t) {
-            OdysseusBridge.LOG.warn("[odysseus] recipe book scan failed: {}", t.toString());
         }
-        OdysseusBridge.LOG.info("[odysseus] no recipe found for {} — book scan returned nothing", output);
         return Optional.empty();
     }
 
-    @SuppressWarnings("unchecked")
-    private static Iterable<Object> allEntriesFromRecipeManager(Object rm) {
-        if (rm == null) return List.of();
-        Class<?> cls = rm.getClass();
-        for (String name : new String[]{"values", "recipes", "getRecipes", "getAllRecipes"}) {
-            Method m = findNoArgMethod(cls, name);
-            if (m == null) continue;
+    /** Find the first no-arg method on `obj` returning a List. Cache is unnecessary — one call per craft. */
+    private static List<?> findFirstListReturn(Object obj) {
+        if (obj == null) return null;
+        for (Method m : obj.getClass().getMethods()) {
+            if (m.getParameterCount() != 0) continue;
+            if (m.getReturnType() != List.class) continue;
+            if (m.getDeclaringClass() == Object.class) continue;
             try {
-                Object r = m.invoke(rm);
-                if (r instanceof Iterable) return (Iterable<Object>) r;
-                if (r instanceof Map) return ((Map<Object, Object>) r).values();
-                if (r instanceof Collection) return (Collection<Object>) r;
+                Object r = m.invoke(obj);
+                if (r instanceof List<?>) return (List<?>) r;
             } catch (Throwable ignore) {}
         }
-        return List.of();
+        return null;
     }
 
-    /** Iterate ClientRecipeBook.getOrderedResults() (or equivalent) and flatten
-     *  every RecipeDisplayEntry within. */
-    @SuppressWarnings("unchecked")
-    private static Iterable<Object> allEntriesFromRecipeBook(Object book) {
-        List<Object> out = new ArrayList<>();
-        if (book == null) return out;
-        Class<?> cls = book.getClass();
-        // Find any method returning a List of collections.
-        Object collections = null;
-        for (String name : new String[]{"getOrderedResults", "getResults", "results",
-                                        "getKeyedResults", "getAllCollections"}) {
-            Method m = findNoArgMethod(cls, name);
-            if (m == null) continue;
+    /** Walk any RecipeDisplayEntry-shaped object looking for an ItemStack result.
+     *  Uses reflection since the RecipeDisplay hierarchy is deeply nested and
+     *  changes every MC version. Two levels deep is enough for all known layouts. */
+    private static ItemStack extractResultStack(Object entry) {
+        if (entry == null) return null;
+        // Level 0: entry itself
+        ItemStack s = firstItemStack(entry);
+        if (s != null) return s;
+        // Level 1: any child object returned by no-arg methods (display, result, output, etc.)
+        for (Method m : entry.getClass().getMethods()) {
+            if (m.getParameterCount() != 0) continue;
+            if (m.getDeclaringClass() == Object.class) continue;
+            Class<?> ret = m.getReturnType();
+            if (ret.isPrimitive() || ret == String.class || ret == Class.class) continue;
             try {
-                Object r = m.invoke(book);
-                if (r instanceof Iterable) { collections = r; break; }
-                if (r instanceof Map) { collections = ((Map<Object, Object>) r).values(); break; }
-            } catch (Throwable ignore) {}
-        }
-        if (collections == null) return out;
-        for (Object collection : (Iterable<Object>) collections) {
-            Class<?> ccls = collection.getClass();
-            for (String innerName : new String[]{"getAllResults", "getResults", "results"}) {
-                Method innerM = null;
-                // getResults may take a boolean; findNoArgMethod won't find it. Also try 1-arg.
-                for (Method cand : ccls.getMethods()) {
-                    if (!cand.getName().equals(innerName)) continue;
-                    if (cand.getParameterCount() == 0) { innerM = cand; break; }
-                }
-                if (innerM != null) {
+                Object child = m.invoke(entry);
+                if (child == null) continue;
+                ItemStack cs = firstItemStack(child);
+                if (cs != null) return cs;
+                // Level 2: dig one more level (display.result.stacks, etc.)
+                for (Method m2 : child.getClass().getMethods()) {
+                    if (m2.getParameterCount() != 0) continue;
+                    if (m2.getDeclaringClass() == Object.class) continue;
+                    Class<?> ret2 = m2.getReturnType();
+                    if (ret2.isPrimitive() || ret2 == String.class || ret2 == Class.class) continue;
                     try {
-                        Object entries = innerM.invoke(collection);
-                        if (entries instanceof Iterable) {
-                            for (Object e : (Iterable<Object>) entries) out.add(e);
-                        }
+                        Object grand = m2.invoke(child);
+                        if (grand == null) continue;
+                        ItemStack gs = firstItemStack(grand);
+                        if (gs != null) return gs;
                     } catch (Throwable ignore) {}
                 }
-            }
+            } catch (Throwable ignore) {}
         }
-        return out;
+        return null;
     }
 
-    private static ItemStack recipeResult(Object entry, World world) {
-        if (entry == null) return null;
-        Object recipe = unwrapRecipe(entry);
-        if (recipe == null) return null;
-        Object regMgr = world.getRegistryManager();
-        Class<?> cls = recipe.getClass();
-        for (String name : new String[]{"getResult", "result", "getResultStack",
-                                        "getOutput", "output", "getResultItem"}) {
-            Method noArg = findNoArgMethod(cls, name);
-            if (noArg != null) {
+    /** Return the first non-empty ItemStack accessible via any no-arg method on obj,
+     *  including List<ItemStack> unwrapping. */
+    private static ItemStack firstItemStack(Object obj) {
+        if (obj == null) return null;
+        if (obj instanceof ItemStack) {
+            ItemStack s = (ItemStack) obj;
+            return s.isEmpty() ? null : s;
+        }
+        for (Method m : obj.getClass().getMethods()) {
+            if (m.getParameterCount() != 0) continue;
+            if (m.getDeclaringClass() == Object.class) continue;
+            Class<?> ret = m.getReturnType();
+            if (ret == ItemStack.class) {
                 try {
-                    Object r = noArg.invoke(recipe);
-                    if (r instanceof ItemStack) return (ItemStack) r;
+                    Object r = m.invoke(obj);
+                    if (r instanceof ItemStack && !((ItemStack) r).isEmpty()) return (ItemStack) r;
                 } catch (Throwable ignore) {}
-            }
-            for (Method cand : cls.getMethods()) {
-                if (!cand.getName().equals(name)) continue;
-                if (cand.getParameterCount() != 1) continue;
-                if (!cand.getParameterTypes()[0].isInstance(regMgr)) continue;
+            } else if (ret == List.class) {
                 try {
-                    Object r = cand.invoke(recipe, regMgr);
-                    if (r instanceof ItemStack) return (ItemStack) r;
+                    Object r = m.invoke(obj);
+                    if (r instanceof List<?>) {
+                        for (Object o : (List<?>) r) {
+                            if (o instanceof ItemStack && !((ItemStack) o).isEmpty()) return (ItemStack) o;
+                        }
+                    }
                 } catch (Throwable ignore) {}
             }
         }
         return null;
     }
 
-    private static Object unwrapRecipe(Object entry) {
-        if (entry == null) return null;
-        for (String name : new String[]{"value", "recipe", "getRecipe", "display"}) {
-            Method m = findNoArgMethod(entry.getClass(), name);
-            if (m == null) continue;
-            try { Object r = m.invoke(entry); if (r != null) return r; } catch (Throwable ignore) {}
-        }
-        return entry;
-    }
-
-    private static Object recipeNetworkId(Object entry) {
-        if (entry == null) return null;
-        for (String name : new String[]{"id", "networkId", "getId", "getNetworkId"}) {
-            Method m = findNoArgMethod(entry.getClass(), name);
-            if (m == null) continue;
-            try { return m.invoke(entry); } catch (Throwable ignore) {}
-        }
-        return null;
-    }
-
+    /** Try each clickRecipe overload with each of the entry's no-arg return values
+     *  as the second argument. Whichever combo has matching types wins. */
     private static boolean tryClickRecipe(ClientPlayerInteractionManager im, int syncId, Object recipeEntry, boolean craftAll) {
-        Object networkId = recipeNetworkId(recipeEntry);
+        // Gather all candidate "second arg" values from the entry — its id, itself, or nested id-like objects.
+        java.util.List<Object> candidates = new java.util.ArrayList<>();
+        candidates.add(recipeEntry);
+        for (Method m : recipeEntry.getClass().getMethods()) {
+            if (m.getParameterCount() != 0) continue;
+            if (m.getDeclaringClass() == Object.class) continue;
+            Class<?> ret = m.getReturnType();
+            if (ret.isPrimitive() || ret == String.class || ret == Class.class || ret == List.class) continue;
+            try {
+                Object v = m.invoke(recipeEntry);
+                if (v != null) candidates.add(v);
+            } catch (Throwable ignore) {}
+        }
         for (Method m : im.getClass().getMethods()) {
             if (!"clickRecipe".equals(m.getName())) continue;
             Class<?>[] p = m.getParameterTypes();
             if (p.length != 3) continue;
             if (!(p[0] == int.class || p[0] == Integer.class)) continue;
             if (!(p[2] == boolean.class || p[2] == Boolean.class)) continue;
-            Object second = null;
-            if (networkId != null && p[1].isInstance(networkId)) second = networkId;
-            else if (p[1].isInstance(recipeEntry)) second = recipeEntry;
-            if (second == null) continue;
-            try { m.invoke(im, syncId, second, craftAll); return true; }
-            catch (Throwable t) { OdysseusBridge.LOG.warn("[odysseus] clickRecipe fail: {}", t.toString()); }
+            for (Object cand : candidates) {
+                if (!p[1].isInstance(cand)) continue;
+                try {
+                    m.invoke(im, syncId, cand, craftAll);
+                    OdysseusBridge.LOG.info("[odysseus] clickRecipe hit with second-arg class {}", cand.getClass().getName());
+                    return true;
+                } catch (Throwable t) {
+                    OdysseusBridge.LOG.warn("[odysseus] clickRecipe throw: {}", t.toString());
+                }
+            }
         }
         return false;
     }
 
-    private static Method findNoArgMethod(Class<?> cls, String name) {
-        for (Method m : cls.getMethods()) {
-            if (m.getName().equals(name) && m.getParameterCount() == 0) return m;
-        }
-        return null;
-    }
+    // ── Misc helpers ──────────────────────────────────────────────────────
 
     private static String normalizeId(String s) {
         s = s.trim().toLowerCase();

@@ -1,9 +1,9 @@
 {
   "schemaVersion": 1,
   "id": "odysseus-bridge",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "name": "Odysseus Bridge",
-  "description": "Bridges Odysseus's Co-Pilot mode to Baritone. Runs a local WebSocket client, receives Baritone commands, and reports events back. No server chat traffic.",
+  "description": "Bridges Odysseus's Co-Pilot mode to Baritone. Runs a local WebSocket client, receives Baritone commands, dispatches custom inventory/crafting commands, and reports events back. No server chat traffic.",
   "authors": ["Gus Miller + Claude"],
   "contact": {
     "sources": "https://github.com/DarthGusiou/Odysseus-bridge-mod"

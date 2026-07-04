@@ -6,14 +6,30 @@ import net.fabricmc.loader.api.FabricLoader;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+/**
+ * Odysseus Bridge — client-side Fabric addon.
+ *
+ * Runs a local WebSocket client that connects to Odysseus, dispatches
+ * commands to Baritone (via reflection) or to our own OdysseusDispatcher
+ * (crafting, chest ops, item use), and forwards Baritone/Odysseus status
+ * messages back through the socket.
+ *
+ * Chat interception uses a ChatHudMixin — Baritone injects into the chat
+ * overlay directly, bypassing Fabric API's receive events.
+ *
+ * Zero server chat traffic — everything happens on your machine.
+ */
 public class OdysseusBridge implements ClientModInitializer {
     public static final String MOD_ID   = "odysseus-bridge";
-    public static final String VERSION  = "0.1.5";
+    public static final String VERSION  = "0.1.6";
     public static final String DEFAULT_URL = "ws://127.0.0.1:7860/api/minecraft/copilot_bridge";
 
     public static final Logger LOG = LoggerFactory.getLogger(MOD_ID);
 
     private static BridgeClient client;
+
+    /** Called by OdysseusDispatcher to send status back to Odysseus. */
+    public static BridgeClient getClient() { return client; }
 
     @Override
     public void onInitializeClient() {
@@ -26,9 +42,13 @@ public class OdysseusBridge implements ClientModInitializer {
         client = new BridgeClient(url);
         client.start();
 
-        LOG.info("Odysseus Bridge {} initialized.", VERSION);
+        // Register the tick pump that runs OdysseusDispatcher's task state machines.
+        OdysseusDispatcher.register();
+
+        LOG.info("Odysseus Bridge {} initialized. Chat interception via ChatHud mixin. Custom commands enabled (!craft, ...).", VERSION);
     }
 
+    /** Called from ChatHudMixin for every message the chat overlay renders. */
     public static void onChatMessage(String text) {
         if (text == null || text.isEmpty() || client == null) return;
         if (!isBaritoneOutput(text)) return;
@@ -43,13 +63,9 @@ public class OdysseusBridge implements ClientModInitializer {
 
     /** Recognize Baritone output regardless of whether it has [Baritone] prefix. */
     private static boolean isBaritoneOutput(String text) {
-        // Skip regular player chat (format: <Name> message)
         if (text.startsWith("<")) return false;
-        // Explicit prefix — user-facing summary lines
         if (text.contains("Baritone")) return true;
-        // Command echo (echoCommands=true)
         if (text.startsWith("> ")) return true;
-        // Baritone-specific type names
         if (text.contains("BetterBlockPos")
             || text.contains("GoalBlock")
             || text.contains("GoalComposite")
@@ -57,7 +73,6 @@ public class OdysseusBridge implements ClientModInitializer {
             || text.contains("GoalNear")
             || text.contains("GoalXZ")
             || text.contains("GoalYLevel")) return true;
-        // Pathfinder chatter
         if (text.contains("movements considered")
             || text.contains("Favoring size")
             || text.contains("Starting to search")
@@ -65,7 +80,6 @@ public class OdysseusBridge implements ClientModInitializer {
             || text.contains("Path ends")
             || text.contains("No path found")
             || text.contains("cost coefficient")) return true;
-        // Status
         if (text.startsWith("Going to:")
             || text.startsWith("Mining")
             || text.startsWith("Farming")

@@ -21,7 +21,7 @@ import org.slf4j.LoggerFactory;
  */
 public class OdysseusBridge implements ClientModInitializer {
     public static final String MOD_ID   = "odysseus-bridge";
-    public static final String VERSION  = "0.1.6";
+    public static final String VERSION  = "0.1.7";
     public static final String DEFAULT_URL = "ws://127.0.0.1:7860/api/minecraft/copilot_bridge";
 
     public static final Logger LOG = LoggerFactory.getLogger(MOD_ID);

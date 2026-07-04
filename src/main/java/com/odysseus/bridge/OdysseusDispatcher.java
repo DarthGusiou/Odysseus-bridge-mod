@@ -28,9 +28,11 @@ import java.util.Map;
 
 public class OdysseusDispatcher {
     private static volatile Task currentTask;
+    private static String lastScreenClass = "<init>";
 
     public static void register() {
         ClientTickEvents.END_CLIENT_TICK.register(OdysseusDispatcher::onTick);
+        ClientTickEvents.END_CLIENT_TICK.register(OdysseusDispatcher::onScreenMonitorTick);
     }
 
     private static void onTick(MinecraftClient client) {
@@ -42,6 +44,17 @@ public class OdysseusDispatcher {
             OdysseusBridge.LOG.warn("[odysseus] task crashed: {}", t.toString());
             emit("error", task.name() + " crashed: " + t.getMessage());
             currentTask = null;
+        }
+    }
+
+    /** Logs every change to client.currentScreen so we can see who's opening screens. */
+    private static void onScreenMonitorTick(MinecraftClient client) {
+        String cur = client.currentScreen == null
+            ? "null"
+            : client.currentScreen.getClass().getName();
+        if (!cur.equals(lastScreenClass)) {
+            OdysseusBridge.LOG.info("[odysseus-screen] currentScreen: {} → {}", lastScreenClass, cur);
+            lastScreenClass = cur;
         }
     }
 
@@ -67,7 +80,6 @@ public class OdysseusDispatcher {
                 currentTask = new UseHeldTask();
                 return;
             case "recipes":
-                // List all known recipes so the AI can see what's supported.
                 StringBuilder sb = new StringBuilder("Known recipes: ");
                 for (String id : RECIPES.keySet()) sb.append(id).append(", ");
                 emit("use_ok", sb.toString());
@@ -83,15 +95,6 @@ public class OdysseusDispatcher {
     }
 
     // ── Hardcoded recipe map ──────────────────────────────────────────────
-    //
-    // Each recipe describes which grid slot needs which ingredient. Slots use
-    // Minecraft's CraftingScreenHandler indexing:
-    //   0 = output (result)
-    //   1 2 3 = top row of 3x3 grid
-    //   4 5 6 = middle row
-    //   7 8 9 = bottom row
-    //   10+ = player inventory (main + hotbar)
-    // Ingredient item ids omit the "minecraft:" prefix.
 
     private static class RecipeSpec {
         final int outputCount;
@@ -106,7 +109,6 @@ public class OdysseusDispatcher {
 
     private static final Map<String, RecipeSpec> RECIPES = new HashMap<>();
     static {
-        // Planks: 1 log → 4 planks, log placed in slot 1.
         String[][] plankMap = {
             {"oak_planks", "oak_log"},
             {"birch_planks", "birch_log"},
@@ -122,49 +124,39 @@ public class OdysseusDispatcher {
             RECIPES.put(pm[0], new RecipeSpec(4, new int[]{1}, new String[]{pm[1]}));
         }
 
-        // Sticks: 2 planks vertical → 4 sticks. Accepts oak_planks; AI can craft planks first.
         RECIPES.put("stick",
             new RecipeSpec(4, new int[]{1, 4}, new String[]{"oak_planks", "oak_planks"}));
 
-        // Crafting table: 4 planks in 2x2 top-left → 1 crafting_table.
         RECIPES.put("crafting_table",
             new RecipeSpec(1, new int[]{1, 2, 4, 5},
                 new String[]{"oak_planks", "oak_planks", "oak_planks", "oak_planks"}));
 
-        // Torch: 1 coal on top, 1 stick below → 4 torches.
         RECIPES.put("torch",
             new RecipeSpec(4, new int[]{1, 4}, new String[]{"coal", "stick"}));
 
-        // Furnace: 8 cobblestone ring (middle empty).
         RECIPES.put("furnace",
             new RecipeSpec(1, new int[]{1, 2, 3, 4, 6, 7, 8, 9},
                 new String[]{"cobblestone","cobblestone","cobblestone","cobblestone",
                              "cobblestone","cobblestone","cobblestone","cobblestone"}));
 
-        // Chest: 8 planks ring.
         RECIPES.put("chest",
             new RecipeSpec(1, new int[]{1, 2, 3, 4, 6, 7, 8, 9},
                 new String[]{"oak_planks","oak_planks","oak_planks","oak_planks",
                              "oak_planks","oak_planks","oak_planks","oak_planks"}));
 
-        // Wooden pickaxe: 3 planks top row + 2 sticks middle column vertical.
         RECIPES.put("wooden_pickaxe",
             new RecipeSpec(1, new int[]{1, 2, 3, 5, 8},
                 new String[]{"oak_planks","oak_planks","oak_planks","stick","stick"}));
-        // Wooden axe: L-shape variant.
         RECIPES.put("wooden_axe",
             new RecipeSpec(1, new int[]{1, 2, 5, 4, 7},
                 new String[]{"oak_planks","oak_planks","oak_planks","stick","stick"}));
-        // Wooden shovel: 1 plank + 2 sticks (center column).
         RECIPES.put("wooden_shovel",
             new RecipeSpec(1, new int[]{2, 5, 8},
                 new String[]{"oak_planks","stick","stick"}));
-        // Wooden sword: 2 planks (center column top) + 1 stick.
         RECIPES.put("wooden_sword",
             new RecipeSpec(1, new int[]{2, 5, 8},
                 new String[]{"oak_planks","oak_planks","stick"}));
 
-        // Stone pickaxe: same layout, cobblestone instead of planks.
         RECIPES.put("stone_pickaxe",
             new RecipeSpec(1, new int[]{1, 2, 3, 5, 8},
                 new String[]{"cobblestone","cobblestone","cobblestone","stick","stick"}));
@@ -182,8 +174,8 @@ public class OdysseusDispatcher {
     // ── Craft task ────────────────────────────────────────────────────────
 
     private static class CraftTask implements Task {
-        private final String targetItemId;      // with minecraft: prefix
-        private final String targetItemKey;     // without prefix — lookup key
+        private final String targetItemId;
+        private final String targetItemKey;
         private final int targetCount;
         private final RecipeSpec recipe;
 
@@ -192,7 +184,7 @@ public class OdysseusDispatcher {
         private int initialInventoryCount = -1;
         private int lastKnownCount = -1;
         private int ingredientIdx = 0;
-        private int subStep = 0;   // 0=pick up source, 1=right-click grid, 2=put back leftover
+        private int subStep = 0;
 
         enum State {
             FIND_TABLE, WAIT_SCREEN, PLACE_INGREDIENTS, WAIT_STEP, TAKE_OUTPUT, WAIT_TAKE,
@@ -304,7 +296,6 @@ public class OdysseusDispatcher {
 
             switch (subStep) {
                 case 0: {
-                    // Find and pick up ingredient from player inventory (slots 10+ in CraftingScreenHandler).
                     int sourceSlot = findItemSlotInHandler(h, ingItem, 10);
                     if (sourceSlot < 0) {
                         emit("craft_failed", "Missing " + ingId + " for " + targetItemKey);
@@ -317,17 +308,14 @@ public class OdysseusDispatcher {
                     return false;
                 }
                 case 1: {
-                    // Right-click grid slot to place one.
                     im.clickSlot(h.syncId, gridSlot, 1, SlotActionType.PICKUP, player);
                     subStep = 2;
                     enter(State.WAIT_STEP);
                     return false;
                 }
                 case 2: {
-                    // Put whatever's on cursor back into inventory (auto-slots to free space).
                     int cursorReturnSlot = findItemSlotInHandler(h, ingItem, 10);
                     if (cursorReturnSlot < 0) {
-                        // Cursor is empty (single-item ingredient) or all placed. Skip.
                         subStep = 0;
                         ingredientIdx++;
                         return false;
@@ -389,13 +377,11 @@ public class OdysseusDispatcher {
                 enter(State.CLEAR_GRID); return false;
             }
             lastKnownCount = haveNow;
-            // Re-place ingredients for the next round.
             ingredientIdx = 0; subStep = 0;
             enter(State.PLACE_INGREDIENTS);
             return false;
         }
 
-        /** Sweep any leftover items from the crafting grid back to inventory before closing. */
         private boolean doClearGrid(MinecraftClient client, ClientPlayerEntity player) {
             ScreenHandler h = player.currentScreenHandler;
             ClientPlayerInteractionManager im = client.interactionManager;
@@ -417,10 +403,27 @@ public class OdysseusDispatcher {
         }
 
         private boolean doClose(MinecraftClient client, ClientPlayerEntity player) {
-            // Just closeHandledScreen — no setScreen(null). Vanilla path, no pause menu.
-            if (player.currentScreenHandler != player.playerScreenHandler) {
-                player.closeHandledScreen();
-            }
+            OdysseusBridge.LOG.info("[odysseus] doClose entered — currentScreen={}, handler={}, playerHandler={}",
+                client.currentScreen == null ? "null" : client.currentScreen.getClass().getSimpleName(),
+                player.currentScreenHandler == null ? "null" : player.currentScreenHandler.getClass().getSimpleName(),
+                player.playerScreenHandler.getClass().getSimpleName());
+
+            // Strategy: call Screen.close() directly on the visible screen if it's a
+            // HandledScreen. This is exactly what pressing E does — the vanilla path,
+            // through the same key-binding handler. If pause menu still opens, we know
+            // it's not us — something else is opening it in response to the screen change.
+            client.execute(() -> {
+                if (client.currentScreen != null) {
+                    OdysseusBridge.LOG.info("[odysseus] calling currentScreen.close() on {}",
+                        client.currentScreen.getClass().getSimpleName());
+                    client.currentScreen.close();
+                } else if (player.currentScreenHandler != player.playerScreenHandler) {
+                    OdysseusBridge.LOG.info("[odysseus] currentScreen was null, calling closeHandledScreen instead");
+                    player.closeHandledScreen();
+                }
+                OdysseusBridge.LOG.info("[odysseus] close callback done — currentScreen={}",
+                    client.currentScreen == null ? "null" : client.currentScreen.getClass().getSimpleName());
+            });
             enter(State.DONE);
             return true;
         }

@@ -21,20 +21,29 @@ import net.minecraft.util.math.Direction;
 import net.minecraft.util.math.Vec3d;
 import net.minecraft.world.World;
 
+import java.lang.reflect.Method;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Optional;
 
 public class OdysseusDispatcher {
     private static volatile Task currentTask;
     private static String lastScreenClass = "<init>";
-    // Ticks remaining during which we auto-close any pause menu that appears.
-    // Set by doClose so a vanilla-triggered pause-restore doesn't strand the user.
     private static int suppressPauseMenuTicks = 0;
+
+    // Baritone state polling — detects when any process transitions from
+    // active → idle so we can emit goal_reached even when Baritone stays
+    // silent on arrival. Debounced to filter mid-path re-planning.
+    private static Boolean lastBaritoneActive = null;
+    private static int baritoneIdleTicks = 0;
+    private static boolean baritoneCompletionEmitted = false;
+    private static final int BARITONE_IDLE_DEBOUNCE_TICKS = 20;   // ~1 second
 
     public static void register() {
         ClientTickEvents.END_CLIENT_TICK.register(OdysseusDispatcher::onTick);
         ClientTickEvents.END_CLIENT_TICK.register(OdysseusDispatcher::onScreenMonitorTick);
         ClientTickEvents.END_CLIENT_TICK.register(OdysseusDispatcher::onPauseMenuGuardTick);
+        ClientTickEvents.END_CLIENT_TICK.register(OdysseusDispatcher::onBaritoneMonitorTick);
     }
 
     private static void onTick(MinecraftClient client) {
@@ -50,19 +59,13 @@ public class OdysseusDispatcher {
     }
 
     private static void onScreenMonitorTick(MinecraftClient client) {
-        String cur = client.currentScreen == null
-            ? "null"
-            : client.currentScreen.getClass().getName();
+        String cur = client.currentScreen == null ? "null" : client.currentScreen.getClass().getName();
         if (!cur.equals(lastScreenClass)) {
             OdysseusBridge.LOG.info("[odysseus-screen] currentScreen: {} → {}", lastScreenClass, cur);
             lastScreenClass = cur;
         }
     }
 
-    /** After our doClose, MC's own pause-state tracking sometimes opens the game
-     *  menu (because we closed the HandledScreen via code, bypassing the key handler
-     *  that would have unpaused cleanly). Intercept for a short window and
-     *  dismiss the pause menu when it appears. */
     private static void onPauseMenuGuardTick(MinecraftClient client) {
         if (suppressPauseMenuTicks <= 0) return;
         suppressPauseMenuTicks--;
@@ -70,6 +73,62 @@ public class OdysseusDispatcher {
             OdysseusBridge.LOG.info("[odysseus] auto-dismissing GameMenuScreen after craft close");
             client.setScreen(null);
             suppressPauseMenuTicks = 0;
+        }
+    }
+
+    /** Poll Baritone's active-process state. On the debounced active → idle
+     *  transition, emit a goal_reached event so the pilot loop can react even
+     *  when Baritone stays silent on arrival. */
+    private static void onBaritoneMonitorTick(MinecraftClient client) {
+        Boolean nowActive = queryBaritoneActive();
+        if (nowActive == null) return;   // Baritone unreachable — nothing to do
+        if (nowActive) {
+            // Something is running. Reset debounce and remember we're active.
+            lastBaritoneActive = true;
+            baritoneIdleTicks = 0;
+            baritoneCompletionEmitted = false;
+            return;
+        }
+        // Not active right now. Only care if we WERE active before.
+        if (!Boolean.TRUE.equals(lastBaritoneActive)) return;
+        if (baritoneCompletionEmitted) return;
+        baritoneIdleTicks++;
+        if (baritoneIdleTicks >= BARITONE_IDLE_DEBOUNCE_TICKS) {
+            baritoneCompletionEmitted = true;
+            lastBaritoneActive = false;
+            OdysseusBridge.LOG.info("[odysseus] baritone: process completed (idle {} ticks)", baritoneIdleTicks);
+            emit("goal_reached", "Pathing complete");
+        }
+    }
+
+    /** Reflection: returns TRUE if any Baritone process is currently in control,
+     *  FALSE if idle, null if Baritone or the classes we need aren't loaded. */
+    private static Boolean queryBaritoneActive() {
+        try {
+            Class<?> apiClass = Class.forName("baritone.api.BaritoneAPI");
+            Object provider = apiClass.getMethod("getProvider").invoke(null);
+            Object primary  = provider.getClass().getMethod("getPrimaryBaritone").invoke(provider);
+            // Preferred: ask the PathingControlManager who's in control right now.
+            try {
+                Object pcm = primary.getClass().getMethod("getPathingControlManager").invoke(primary);
+                Object opt = pcm.getClass().getMethod("mostRecentInControl").invoke(pcm);
+                if (opt instanceof java.util.Optional<?>) {
+                    return ((java.util.Optional<?>) opt).isPresent();
+                }
+                // Some forks return their own optional-like wrapper — probe for isPresent()
+                Method isPresent = opt.getClass().getMethod("isPresent");
+                Object r = isPresent.invoke(opt);
+                if (r instanceof Boolean) return (Boolean) r;
+            } catch (Throwable ignored) {
+                // Older API — fall through to pathingBehavior.isPathing()
+            }
+            Object pathing = primary.getClass().getMethod("getPathingBehavior").invoke(primary);
+            Object r = pathing.getClass().getMethod("isPathing").invoke(pathing);
+            return (r instanceof Boolean) ? (Boolean) r : null;
+        } catch (ClassNotFoundException notFound) {
+            return null;
+        } catch (Throwable t) {
+            return null;
         }
     }
 
@@ -116,74 +175,48 @@ public class OdysseusDispatcher {
         final int[] slots;
         final String[] items;
         RecipeSpec(int outputCount, int[] slots, String[] items) {
-            this.outputCount = outputCount;
-            this.slots = slots;
-            this.items = items;
+            this.outputCount = outputCount; this.slots = slots; this.items = items;
         }
     }
 
     private static final Map<String, RecipeSpec> RECIPES = new HashMap<>();
     static {
         String[][] plankMap = {
-            {"oak_planks", "oak_log"},
-            {"birch_planks", "birch_log"},
-            {"spruce_planks", "spruce_log"},
-            {"jungle_planks", "jungle_log"},
-            {"acacia_planks", "acacia_log"},
-            {"dark_oak_planks", "dark_oak_log"},
-            {"mangrove_planks", "mangrove_log"},
-            {"cherry_planks", "cherry_log"},
+            {"oak_planks", "oak_log"}, {"birch_planks", "birch_log"},
+            {"spruce_planks", "spruce_log"}, {"jungle_planks", "jungle_log"},
+            {"acacia_planks", "acacia_log"}, {"dark_oak_planks", "dark_oak_log"},
+            {"mangrove_planks", "mangrove_log"}, {"cherry_planks", "cherry_log"},
             {"pale_oak_planks", "pale_oak_log"},
         };
         for (String[] pm : plankMap) {
             RECIPES.put(pm[0], new RecipeSpec(4, new int[]{1}, new String[]{pm[1]}));
         }
-
-        RECIPES.put("stick",
-            new RecipeSpec(4, new int[]{1, 4}, new String[]{"oak_planks", "oak_planks"}));
-
-        RECIPES.put("crafting_table",
-            new RecipeSpec(1, new int[]{1, 2, 4, 5},
-                new String[]{"oak_planks", "oak_planks", "oak_planks", "oak_planks"}));
-
-        RECIPES.put("torch",
-            new RecipeSpec(4, new int[]{1, 4}, new String[]{"coal", "stick"}));
-
-        RECIPES.put("furnace",
-            new RecipeSpec(1, new int[]{1, 2, 3, 4, 6, 7, 8, 9},
-                new String[]{"cobblestone","cobblestone","cobblestone","cobblestone",
-                             "cobblestone","cobblestone","cobblestone","cobblestone"}));
-
-        RECIPES.put("chest",
-            new RecipeSpec(1, new int[]{1, 2, 3, 4, 6, 7, 8, 9},
-                new String[]{"oak_planks","oak_planks","oak_planks","oak_planks",
-                             "oak_planks","oak_planks","oak_planks","oak_planks"}));
-
-        RECIPES.put("wooden_pickaxe",
-            new RecipeSpec(1, new int[]{1, 2, 3, 5, 8},
-                new String[]{"oak_planks","oak_planks","oak_planks","stick","stick"}));
-        RECIPES.put("wooden_axe",
-            new RecipeSpec(1, new int[]{1, 2, 5, 4, 7},
-                new String[]{"oak_planks","oak_planks","oak_planks","stick","stick"}));
-        RECIPES.put("wooden_shovel",
-            new RecipeSpec(1, new int[]{2, 5, 8},
-                new String[]{"oak_planks","stick","stick"}));
-        RECIPES.put("wooden_sword",
-            new RecipeSpec(1, new int[]{2, 5, 8},
-                new String[]{"oak_planks","oak_planks","stick"}));
-
-        RECIPES.put("stone_pickaxe",
-            new RecipeSpec(1, new int[]{1, 2, 3, 5, 8},
-                new String[]{"cobblestone","cobblestone","cobblestone","stick","stick"}));
-        RECIPES.put("stone_axe",
-            new RecipeSpec(1, new int[]{1, 2, 5, 4, 7},
-                new String[]{"cobblestone","cobblestone","cobblestone","stick","stick"}));
-        RECIPES.put("stone_shovel",
-            new RecipeSpec(1, new int[]{2, 5, 8},
-                new String[]{"cobblestone","stick","stick"}));
-        RECIPES.put("stone_sword",
-            new RecipeSpec(1, new int[]{2, 5, 8},
-                new String[]{"cobblestone","cobblestone","stick"}));
+        RECIPES.put("stick", new RecipeSpec(4, new int[]{1, 4}, new String[]{"oak_planks", "oak_planks"}));
+        RECIPES.put("crafting_table", new RecipeSpec(1, new int[]{1, 2, 4, 5},
+            new String[]{"oak_planks", "oak_planks", "oak_planks", "oak_planks"}));
+        RECIPES.put("torch", new RecipeSpec(4, new int[]{1, 4}, new String[]{"coal", "stick"}));
+        RECIPES.put("furnace", new RecipeSpec(1, new int[]{1, 2, 3, 4, 6, 7, 8, 9},
+            new String[]{"cobblestone","cobblestone","cobblestone","cobblestone",
+                         "cobblestone","cobblestone","cobblestone","cobblestone"}));
+        RECIPES.put("chest", new RecipeSpec(1, new int[]{1, 2, 3, 4, 6, 7, 8, 9},
+            new String[]{"oak_planks","oak_planks","oak_planks","oak_planks",
+                         "oak_planks","oak_planks","oak_planks","oak_planks"}));
+        RECIPES.put("wooden_pickaxe", new RecipeSpec(1, new int[]{1, 2, 3, 5, 8},
+            new String[]{"oak_planks","oak_planks","oak_planks","stick","stick"}));
+        RECIPES.put("wooden_axe", new RecipeSpec(1, new int[]{1, 2, 5, 4, 7},
+            new String[]{"oak_planks","oak_planks","oak_planks","stick","stick"}));
+        RECIPES.put("wooden_shovel", new RecipeSpec(1, new int[]{2, 5, 8},
+            new String[]{"oak_planks","stick","stick"}));
+        RECIPES.put("wooden_sword", new RecipeSpec(1, new int[]{2, 5, 8},
+            new String[]{"oak_planks","oak_planks","stick"}));
+        RECIPES.put("stone_pickaxe", new RecipeSpec(1, new int[]{1, 2, 3, 5, 8},
+            new String[]{"cobblestone","cobblestone","cobblestone","stick","stick"}));
+        RECIPES.put("stone_axe", new RecipeSpec(1, new int[]{1, 2, 5, 4, 7},
+            new String[]{"cobblestone","cobblestone","cobblestone","stick","stick"}));
+        RECIPES.put("stone_shovel", new RecipeSpec(1, new int[]{2, 5, 8},
+            new String[]{"cobblestone","stick","stick"}));
+        RECIPES.put("stone_sword", new RecipeSpec(1, new int[]{2, 5, 8},
+            new String[]{"cobblestone","cobblestone","stick"}));
     }
 
     // ── Craft task ────────────────────────────────────────────────────────
@@ -243,16 +276,14 @@ public class OdysseusDispatcher {
 
         private boolean doFindTable(MinecraftClient client, ClientPlayerEntity player, World world) {
             if (recipe == null) {
-                emit("craft_failed", "No hardcoded recipe for " + targetItemKey
-                    + " — run !recipes to see supported ones.");
+                emit("craft_failed", "No hardcoded recipe for " + targetItemKey + " — run !recipes to see supported ones.");
                 enter(State.DONE); return true;
             }
             if (player.currentScreenHandler instanceof CraftingScreenHandler) {
                 initialInventoryCount = countInInventory(player, itemFromId(targetItemId));
                 lastKnownCount = initialInventoryCount;
                 ingredientIdx = 0; subStep = 0;
-                enter(State.PLACE_INGREDIENTS);
-                return false;
+                enter(State.PLACE_INGREDIENTS); return false;
             }
             BlockPos here = player.getBlockPos();
             BlockPos found = null;
@@ -280,8 +311,7 @@ public class OdysseusDispatcher {
                 initialInventoryCount = countInInventory(player, itemFromId(targetItemId));
                 lastKnownCount = initialInventoryCount;
                 ingredientIdx = 0; subStep = 0;
-                enter(State.PLACE_INGREDIENTS);
-                return false;
+                enter(State.PLACE_INGREDIENTS); return false;
             }
             if (ticksInState > 40) {
                 emit("craft_failed", "Timed out waiting for crafting screen to open.");
@@ -297,10 +327,7 @@ public class OdysseusDispatcher {
                 emit("craft_failed", "Crafting screen closed unexpectedly.");
                 enter(State.CLOSE); return false;
             }
-            if (ingredientIdx >= recipe.slots.length) {
-                enter(State.TAKE_OUTPUT);
-                return false;
-            }
+            if (ingredientIdx >= recipe.slots.length) { enter(State.TAKE_OUTPUT); return false; }
             int gridSlot = recipe.slots[ingredientIdx];
             String ingId = recipe.items[ingredientIdx];
             Item ingItem = itemFromId("minecraft:" + ingId);
@@ -308,38 +335,25 @@ public class OdysseusDispatcher {
                 emit("craft_failed", "Unknown ingredient in recipe: " + ingId);
                 enter(State.CLOSE); return false;
             }
-
             switch (subStep) {
                 case 0: {
                     int sourceSlot = findItemSlotInHandler(h, ingItem, 10);
                     if (sourceSlot < 0) {
                         emit("craft_failed", "Missing " + ingId + " for " + targetItemKey);
-                        enter(State.CLEAR_GRID);
-                        return false;
+                        enter(State.CLEAR_GRID); return false;
                     }
                     im.clickSlot(h.syncId, sourceSlot, 0, SlotActionType.PICKUP, player);
-                    subStep = 1;
-                    enter(State.WAIT_STEP);
-                    return false;
+                    subStep = 1; enter(State.WAIT_STEP); return false;
                 }
                 case 1: {
                     im.clickSlot(h.syncId, gridSlot, 1, SlotActionType.PICKUP, player);
-                    subStep = 2;
-                    enter(State.WAIT_STEP);
-                    return false;
+                    subStep = 2; enter(State.WAIT_STEP); return false;
                 }
                 case 2: {
                     int cursorReturnSlot = findItemSlotInHandler(h, ingItem, 10);
-                    if (cursorReturnSlot < 0) {
-                        subStep = 0;
-                        ingredientIdx++;
-                        return false;
-                    }
+                    if (cursorReturnSlot < 0) { subStep = 0; ingredientIdx++; return false; }
                     im.clickSlot(h.syncId, cursorReturnSlot, 0, SlotActionType.PICKUP, player);
-                    subStep = 0;
-                    ingredientIdx++;
-                    enter(State.WAIT_STEP);
-                    return false;
+                    subStep = 0; ingredientIdx++; enter(State.WAIT_STEP); return false;
                 }
             }
             return false;
@@ -360,16 +374,13 @@ public class OdysseusDispatcher {
             if (outputStack.isEmpty()) {
                 int haveNow = countInInventory(player, itemFromId(targetItemId));
                 int delta = haveNow - initialInventoryCount;
-                if (delta > 0) emit("craft_ok",
-                    "Crafted " + delta + " " + targetItemKey + " (inventory now: " + haveNow + ")");
-                else emit("craft_failed",
-                    "Grid empty — ingredient placement failed for " + targetItemKey);
+                if (delta > 0) emit("craft_ok", "Crafted " + delta + " " + targetItemKey + " (inventory now: " + haveNow + ")");
+                else emit("craft_failed", "Grid empty — ingredient placement failed for " + targetItemKey);
                 enter(State.CLEAR_GRID); return false;
             }
             ClientPlayerInteractionManager im = client.interactionManager;
             if (im != null) im.clickSlot(h.syncId, 0, 0, SlotActionType.QUICK_MOVE, player);
-            enter(State.WAIT_TAKE);
-            return false;
+            enter(State.WAIT_TAKE); return false;
         }
 
         private boolean doWaitTake() {
@@ -382,34 +393,28 @@ public class OdysseusDispatcher {
             int haveNow = countInInventory(player, target);
             int crafted = haveNow - initialInventoryCount;
             if (crafted >= targetCount) {
-                emit("craft_ok", "Crafted " + crafted + " " + targetItemKey
-                    + " (target " + targetCount + ", inventory " + haveNow + ")");
+                emit("craft_ok", "Crafted " + crafted + " " + targetItemKey + " (target " + targetCount + ", inventory " + haveNow + ")");
                 enter(State.CLEAR_GRID); return false;
             }
             if (haveNow == lastKnownCount) {
-                emit("craft_failed", "Stopped at " + crafted + "/" + targetCount
-                    + " — no more ingredients for " + targetItemKey);
+                emit("craft_failed", "Stopped at " + crafted + "/" + targetCount + " — no more ingredients for " + targetItemKey);
                 enter(State.CLEAR_GRID); return false;
             }
             lastKnownCount = haveNow;
             ingredientIdx = 0; subStep = 0;
-            enter(State.PLACE_INGREDIENTS);
-            return false;
+            enter(State.PLACE_INGREDIENTS); return false;
         }
 
         private boolean doClearGrid(MinecraftClient client, ClientPlayerEntity player) {
             ScreenHandler h = player.currentScreenHandler;
             ClientPlayerInteractionManager im = client.interactionManager;
-            if (!(h instanceof CraftingScreenHandler) || im == null) {
-                enter(State.CLOSE); return false;
-            }
+            if (!(h instanceof CraftingScreenHandler) || im == null) { enter(State.CLOSE); return false; }
             for (int i = 1; i <= 9; i++) {
                 if (!h.slots.get(i).getStack().isEmpty()) {
                     im.clickSlot(h.syncId, i, 0, SlotActionType.QUICK_MOVE, player);
                 }
             }
-            enter(State.WAIT_CLEAR);
-            return false;
+            enter(State.WAIT_CLEAR); return false;
         }
 
         private boolean doWaitClear() {
@@ -419,9 +424,6 @@ public class OdysseusDispatcher {
 
         private boolean doClose(MinecraftClient client, ClientPlayerEntity player) {
             OdysseusBridge.LOG.info("[odysseus] doClose — closing screen and arming pause-menu guard");
-            // Arm the pause-menu guard BEFORE closing — MC opens GameMenuScreen
-            // reactively on the next tick after HandledScreen close (single-player
-            // pause-state restore behavior). Guard runs for 20 ticks (~1 second).
             suppressPauseMenuTicks = 20;
             client.execute(() -> {
                 if (client.currentScreen != null) {

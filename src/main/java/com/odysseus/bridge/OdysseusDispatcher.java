@@ -3,6 +3,7 @@ package com.odysseus.bridge;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.minecraft.block.Blocks;
 import net.minecraft.client.MinecraftClient;
+import net.minecraft.client.gui.screen.GameMenuScreen;
 import net.minecraft.client.network.ClientPlayerEntity;
 import net.minecraft.client.network.ClientPlayerInteractionManager;
 import net.minecraft.entity.player.PlayerInventory;
@@ -20,19 +21,20 @@ import net.minecraft.util.math.Direction;
 import net.minecraft.util.math.Vec3d;
 import net.minecraft.world.World;
 
-import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.HashMap;
-import java.util.List;
 import java.util.Map;
 
 public class OdysseusDispatcher {
     private static volatile Task currentTask;
     private static String lastScreenClass = "<init>";
+    // Ticks remaining during which we auto-close any pause menu that appears.
+    // Set by doClose so a vanilla-triggered pause-restore doesn't strand the user.
+    private static int suppressPauseMenuTicks = 0;
 
     public static void register() {
         ClientTickEvents.END_CLIENT_TICK.register(OdysseusDispatcher::onTick);
         ClientTickEvents.END_CLIENT_TICK.register(OdysseusDispatcher::onScreenMonitorTick);
+        ClientTickEvents.END_CLIENT_TICK.register(OdysseusDispatcher::onPauseMenuGuardTick);
     }
 
     private static void onTick(MinecraftClient client) {
@@ -47,7 +49,6 @@ public class OdysseusDispatcher {
         }
     }
 
-    /** Logs every change to client.currentScreen so we can see who's opening screens. */
     private static void onScreenMonitorTick(MinecraftClient client) {
         String cur = client.currentScreen == null
             ? "null"
@@ -55,6 +56,20 @@ public class OdysseusDispatcher {
         if (!cur.equals(lastScreenClass)) {
             OdysseusBridge.LOG.info("[odysseus-screen] currentScreen: {} → {}", lastScreenClass, cur);
             lastScreenClass = cur;
+        }
+    }
+
+    /** After our doClose, MC's own pause-state tracking sometimes opens the game
+     *  menu (because we closed the HandledScreen via code, bypassing the key handler
+     *  that would have unpaused cleanly). Intercept for a short window and
+     *  dismiss the pause menu when it appears. */
+    private static void onPauseMenuGuardTick(MinecraftClient client) {
+        if (suppressPauseMenuTicks <= 0) return;
+        suppressPauseMenuTicks--;
+        if (client.currentScreen instanceof GameMenuScreen) {
+            OdysseusBridge.LOG.info("[odysseus] auto-dismissing GameMenuScreen after craft close");
+            client.setScreen(null);
+            suppressPauseMenuTicks = 0;
         }
     }
 
@@ -403,26 +418,17 @@ public class OdysseusDispatcher {
         }
 
         private boolean doClose(MinecraftClient client, ClientPlayerEntity player) {
-            OdysseusBridge.LOG.info("[odysseus] doClose entered — currentScreen={}, handler={}, playerHandler={}",
-                client.currentScreen == null ? "null" : client.currentScreen.getClass().getSimpleName(),
-                player.currentScreenHandler == null ? "null" : player.currentScreenHandler.getClass().getSimpleName(),
-                player.playerScreenHandler.getClass().getSimpleName());
-
-            // Strategy: call Screen.close() directly on the visible screen if it's a
-            // HandledScreen. This is exactly what pressing E does — the vanilla path,
-            // through the same key-binding handler. If pause menu still opens, we know
-            // it's not us — something else is opening it in response to the screen change.
+            OdysseusBridge.LOG.info("[odysseus] doClose — closing screen and arming pause-menu guard");
+            // Arm the pause-menu guard BEFORE closing — MC opens GameMenuScreen
+            // reactively on the next tick after HandledScreen close (single-player
+            // pause-state restore behavior). Guard runs for 20 ticks (~1 second).
+            suppressPauseMenuTicks = 20;
             client.execute(() -> {
                 if (client.currentScreen != null) {
-                    OdysseusBridge.LOG.info("[odysseus] calling currentScreen.close() on {}",
-                        client.currentScreen.getClass().getSimpleName());
                     client.currentScreen.close();
                 } else if (player.currentScreenHandler != player.playerScreenHandler) {
-                    OdysseusBridge.LOG.info("[odysseus] currentScreen was null, calling closeHandledScreen instead");
                     player.closeHandledScreen();
                 }
-                OdysseusBridge.LOG.info("[odysseus] close callback done — currentScreen={}",
-                    client.currentScreen == null ? "null" : client.currentScreen.getClass().getSimpleName());
             });
             enter(State.DONE);
             return true;

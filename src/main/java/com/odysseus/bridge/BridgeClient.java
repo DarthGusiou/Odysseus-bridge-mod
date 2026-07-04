@@ -14,8 +14,8 @@ import java.util.concurrent.TimeUnit;
 
 /**
  * WebSocket client. Connects to Odysseus, sends "hello" on connect,
- * routes incoming commands to the Baritone dispatcher, and forwards
- * events sent via {@link #sendEvent}.
+ * routes incoming commands to Baritone or OdysseusDispatcher based on
+ * prefix, and forwards events sent via {@link #sendEvent}.
  *
  * Auto-reconnects with exponential-ish backoff (5s → 30s cap) so a
  * temporarily-down Odysseus doesn't require a game restart.
@@ -60,7 +60,13 @@ public class BridgeClient {
                         String type = msg.has("type") ? msg.get("type").getAsString() : "";
                         if ("cmd".equals(type)) {
                             String cmd = msg.has("value") ? msg.get("value").getAsString() : "";
-                            BaritoneDispatcher.execute(cmd);
+                            // Route by prefix — # = Baritone, ! = custom Odysseus commands.
+                            String trimmed = cmd.trim();
+                            if (trimmed.startsWith("!")) {
+                                OdysseusDispatcher.execute(trimmed, BridgeClient.this);
+                            } else {
+                                BaritoneDispatcher.execute(cmd);
+                            }
                         } else if ("ping".equals(type)) {
                             JsonObject pong = new JsonObject();
                             pong.addProperty("type", "pong");
@@ -109,7 +115,7 @@ public class BridgeClient {
         socket.send(hello.toString());
     }
 
-    /** Called by BaritoneHook when Baritone emits an event we care about. */
+    /** Called by dispatchers when they have status to report back to Odysseus. */
     public void sendEvent(String event, String text) {
         WebSocketClient s = this.socket;
         if (s == null || !s.isOpen()) return;

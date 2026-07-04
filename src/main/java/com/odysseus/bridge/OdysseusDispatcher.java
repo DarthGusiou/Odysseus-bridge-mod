@@ -20,9 +20,11 @@ import net.minecraft.util.math.Direction;
 import net.minecraft.util.math.Vec3d;
 import net.minecraft.world.World;
 
-import java.lang.reflect.Method;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashMap;
 import java.util.List;
-import java.util.Optional;
+import java.util.Map;
 
 public class OdysseusDispatcher {
     private static volatile Task currentTask;
@@ -64,8 +66,11 @@ public class OdysseusDispatcher {
             case "use":
                 currentTask = new UseHeldTask();
                 return;
-            case "debug_recipes":
-                currentTask = new DebugRecipesTask();
+            case "recipes":
+                // List all known recipes so the AI can see what's supported.
+                StringBuilder sb = new StringBuilder("Known recipes: ");
+                for (String id : RECIPES.keySet()) sb.append(id).append(", ");
+                emit("use_ok", sb.toString());
                 return;
             default:
                 emit("unknown_command", "Unknown Odysseus command: !" + verb);
@@ -77,83 +82,133 @@ public class OdysseusDispatcher {
         String name();
     }
 
-    // ── Debug: dump ClientRecipeBook.method_1393()[0] deeply ──────────────
+    // ── Hardcoded recipe map ──────────────────────────────────────────────
+    //
+    // Each recipe describes which grid slot needs which ingredient. Slots use
+    // Minecraft's CraftingScreenHandler indexing:
+    //   0 = output (result)
+    //   1 2 3 = top row of 3x3 grid
+    //   4 5 6 = middle row
+    //   7 8 9 = bottom row
+    //   10+ = player inventory (main + hotbar)
+    // Ingredient item ids omit the "minecraft:" prefix.
 
-    private static class DebugRecipesTask implements Task {
-        @Override public String name() { return "debug recipes"; }
-        @Override
-        public boolean tick(MinecraftClient client) {
-            ClientPlayerEntity player = client.player;
-            if (player == null) { emit("error", "no player"); return true; }
-            Object book;
-            try { book = player.getRecipeBook(); } catch (Throwable t) { book = null; }
-            if (book == null) { emit("error", "no recipe book"); return true; }
-            OdysseusBridge.LOG.info("[odysseus-debug] book class: {}", book.getClass().getName());
-            List<?> list = findFirstListReturn(book);
-            if (list == null) {
-                OdysseusBridge.LOG.info("[odysseus-debug] no List-returning no-arg method found on book");
-                emit("use_ok", "No List method on book");
-                return true;
-            }
-            OdysseusBridge.LOG.info("[odysseus-debug] book list size: {}", list.size());
-            if (list.isEmpty()) { emit("use_ok", "Book list empty"); return true; }
-            Object first = list.get(0);
-            OdysseusBridge.LOG.info("[odysseus-debug] entry[0] class: {}", first.getClass().getName());
-            dumpNoArgMethods(first, "entry[0]");
-            // Recurse into every no-arg method result to see what's inside
-            for (Method m : first.getClass().getMethods()) {
-                if (m.getParameterCount() != 0) continue;
-                if (m.getDeclaringClass() == Object.class) continue;
-                try {
-                    Object sub = m.invoke(first);
-                    if (sub == null) continue;
-                    OdysseusBridge.LOG.info("[odysseus-debug]   entry[0].{}() = {} class={}",
-                        m.getName(),
-                        sub.toString().length() > 80 ? sub.toString().substring(0, 80) + "…" : sub.toString(),
-                        sub.getClass().getName());
-                    if (m.getReturnType().isPrimitive()
-                        || sub instanceof String || sub instanceof Number || sub instanceof Boolean
-                        || sub.getClass().isArray()) continue;
-                    dumpNoArgMethods(sub, "  " + m.getName() + "()→");
-                } catch (Throwable t) {
-                    OdysseusBridge.LOG.info("[odysseus-debug]   entry[0].{}() threw: {}", m.getName(), t.toString());
-                }
-            }
-            emit("use_ok", "Deep dump complete — grep MC log for [odysseus-debug]");
-            return true;
+    private static class RecipeSpec {
+        final int outputCount;
+        final int[] slots;
+        final String[] items;
+        RecipeSpec(int outputCount, int[] slots, String[] items) {
+            this.outputCount = outputCount;
+            this.slots = slots;
+            this.items = items;
         }
     }
 
-    private static void dumpNoArgMethods(Object obj, String label) {
-        if (obj == null) return;
-        for (Method m : obj.getClass().getMethods()) {
-            if (m.getParameterCount() != 0) continue;
-            if (m.getDeclaringClass() == Object.class) continue;
-            OdysseusBridge.LOG.info("[odysseus-debug] {}.{}() → {}",
-                label, m.getName(), m.getReturnType().getSimpleName());
+    private static final Map<String, RecipeSpec> RECIPES = new HashMap<>();
+    static {
+        // Planks: 1 log → 4 planks, log placed in slot 1.
+        String[][] plankMap = {
+            {"oak_planks", "oak_log"},
+            {"birch_planks", "birch_log"},
+            {"spruce_planks", "spruce_log"},
+            {"jungle_planks", "jungle_log"},
+            {"acacia_planks", "acacia_log"},
+            {"dark_oak_planks", "dark_oak_log"},
+            {"mangrove_planks", "mangrove_log"},
+            {"cherry_planks", "cherry_log"},
+            {"pale_oak_planks", "pale_oak_log"},
+        };
+        for (String[] pm : plankMap) {
+            RECIPES.put(pm[0], new RecipeSpec(4, new int[]{1}, new String[]{pm[1]}));
         }
+
+        // Sticks: 2 planks vertical → 4 sticks. Accepts oak_planks; AI can craft planks first.
+        RECIPES.put("stick",
+            new RecipeSpec(4, new int[]{1, 4}, new String[]{"oak_planks", "oak_planks"}));
+
+        // Crafting table: 4 planks in 2x2 top-left → 1 crafting_table.
+        RECIPES.put("crafting_table",
+            new RecipeSpec(1, new int[]{1, 2, 4, 5},
+                new String[]{"oak_planks", "oak_planks", "oak_planks", "oak_planks"}));
+
+        // Torch: 1 coal on top, 1 stick below → 4 torches.
+        RECIPES.put("torch",
+            new RecipeSpec(4, new int[]{1, 4}, new String[]{"coal", "stick"}));
+
+        // Furnace: 8 cobblestone ring (middle empty).
+        RECIPES.put("furnace",
+            new RecipeSpec(1, new int[]{1, 2, 3, 4, 6, 7, 8, 9},
+                new String[]{"cobblestone","cobblestone","cobblestone","cobblestone",
+                             "cobblestone","cobblestone","cobblestone","cobblestone"}));
+
+        // Chest: 8 planks ring.
+        RECIPES.put("chest",
+            new RecipeSpec(1, new int[]{1, 2, 3, 4, 6, 7, 8, 9},
+                new String[]{"oak_planks","oak_planks","oak_planks","oak_planks",
+                             "oak_planks","oak_planks","oak_planks","oak_planks"}));
+
+        // Wooden pickaxe: 3 planks top row + 2 sticks middle column vertical.
+        RECIPES.put("wooden_pickaxe",
+            new RecipeSpec(1, new int[]{1, 2, 3, 5, 8},
+                new String[]{"oak_planks","oak_planks","oak_planks","stick","stick"}));
+        // Wooden axe: L-shape variant.
+        RECIPES.put("wooden_axe",
+            new RecipeSpec(1, new int[]{1, 2, 5, 4, 7},
+                new String[]{"oak_planks","oak_planks","oak_planks","stick","stick"}));
+        // Wooden shovel: 1 plank + 2 sticks (center column).
+        RECIPES.put("wooden_shovel",
+            new RecipeSpec(1, new int[]{2, 5, 8},
+                new String[]{"oak_planks","stick","stick"}));
+        // Wooden sword: 2 planks (center column top) + 1 stick.
+        RECIPES.put("wooden_sword",
+            new RecipeSpec(1, new int[]{2, 5, 8},
+                new String[]{"oak_planks","oak_planks","stick"}));
+
+        // Stone pickaxe: same layout, cobblestone instead of planks.
+        RECIPES.put("stone_pickaxe",
+            new RecipeSpec(1, new int[]{1, 2, 3, 5, 8},
+                new String[]{"cobblestone","cobblestone","cobblestone","stick","stick"}));
+        RECIPES.put("stone_axe",
+            new RecipeSpec(1, new int[]{1, 2, 5, 4, 7},
+                new String[]{"cobblestone","cobblestone","cobblestone","stick","stick"}));
+        RECIPES.put("stone_shovel",
+            new RecipeSpec(1, new int[]{2, 5, 8},
+                new String[]{"cobblestone","stick","stick"}));
+        RECIPES.put("stone_sword",
+            new RecipeSpec(1, new int[]{2, 5, 8},
+                new String[]{"cobblestone","cobblestone","stick"}));
     }
 
     // ── Craft task ────────────────────────────────────────────────────────
 
     private static class CraftTask implements Task {
-        private final String targetItemId;
+        private final String targetItemId;      // with minecraft: prefix
+        private final String targetItemKey;     // without prefix — lookup key
         private final int targetCount;
+        private final RecipeSpec recipe;
 
         private State state = State.FIND_TABLE;
         private int ticksInState = 0;
         private int initialInventoryCount = -1;
         private int lastKnownCount = -1;
-        private Object recipeEntry;
+        private int ingredientIdx = 0;
+        private int subStep = 0;   // 0=pick up source, 1=right-click grid, 2=put back leftover
 
-        enum State { FIND_TABLE, WAIT_SCREEN, CLICK_RECIPE, WAIT_FILL, TAKE_OUTPUT, WAIT_TAKE, CHECK_COUNT, CLOSE, DONE }
-
-        CraftTask(String itemId, int count) {
-            this.targetItemId = normalizeId(itemId);
-            this.targetCount = Math.max(1, count);
+        enum State {
+            FIND_TABLE, WAIT_SCREEN, PLACE_INGREDIENTS, WAIT_STEP, TAKE_OUTPUT, WAIT_TAKE,
+            CHECK_COUNT, CLEAR_GRID, WAIT_CLEAR, CLOSE, DONE
         }
 
-        @Override public String name() { return "craft " + targetItemId + " x" + targetCount; }
+        CraftTask(String itemId, int count) {
+            String norm = itemId.trim().toLowerCase();
+            if (norm.startsWith("minecraft:")) norm = norm.substring("minecraft:".length());
+            this.targetItemKey = norm;
+            this.targetItemId = "minecraft:" + norm;
+            this.targetCount = Math.max(1, count);
+            this.recipe = RECIPES.get(norm);
+        }
+
+        @Override public String name() { return "craft " + targetItemKey + " x" + targetCount; }
 
         @Override
         public boolean tick(MinecraftClient client) {
@@ -162,15 +217,17 @@ public class OdysseusDispatcher {
             if (player == null || world == null) return false;
             ticksInState++;
             switch (state) {
-                case FIND_TABLE:   return doFindTable(client, player, world);
-                case WAIT_SCREEN:  return doWaitScreen(client, player);
-                case CLICK_RECIPE: return doClickRecipe(client, player, world);
-                case WAIT_FILL:    return doWaitFill(client, player);
-                case TAKE_OUTPUT:  return doTakeOutput(client, player);
-                case WAIT_TAKE:    return doWaitTake(client, player);
-                case CHECK_COUNT:  return doCheckCount(client, player);
-                case CLOSE:        return doClose(client, player);
-                case DONE:         return true;
+                case FIND_TABLE:        return doFindTable(client, player, world);
+                case WAIT_SCREEN:       return doWaitScreen(client, player);
+                case PLACE_INGREDIENTS: return doPlaceIngredients(client, player);
+                case WAIT_STEP:         return doWaitStep();
+                case TAKE_OUTPUT:       return doTakeOutput(client, player);
+                case WAIT_TAKE:         return doWaitTake();
+                case CHECK_COUNT:       return doCheckCount(client, player);
+                case CLEAR_GRID:        return doClearGrid(client, player);
+                case WAIT_CLEAR:        return doWaitClear();
+                case CLOSE:             return doClose(client, player);
+                case DONE:              return true;
             }
             return true;
         }
@@ -178,8 +235,17 @@ public class OdysseusDispatcher {
         private void enter(State next) { this.state = next; this.ticksInState = 0; }
 
         private boolean doFindTable(MinecraftClient client, ClientPlayerEntity player, World world) {
+            if (recipe == null) {
+                emit("craft_failed", "No hardcoded recipe for " + targetItemKey
+                    + " — run !recipes to see supported ones.");
+                enter(State.DONE); return true;
+            }
             if (player.currentScreenHandler instanceof CraftingScreenHandler) {
-                enter(State.CLICK_RECIPE); return false;
+                initialInventoryCount = countInInventory(player, itemFromId(targetItemId));
+                lastKnownCount = initialInventoryCount;
+                ingredientIdx = 0; subStep = 0;
+                enter(State.PLACE_INGREDIENTS);
+                return false;
             }
             BlockPos here = player.getBlockPos();
             BlockPos found = null;
@@ -204,7 +270,11 @@ public class OdysseusDispatcher {
 
         private boolean doWaitScreen(MinecraftClient client, ClientPlayerEntity player) {
             if (player.currentScreenHandler instanceof CraftingScreenHandler) {
-                enter(State.CLICK_RECIPE); return false;
+                initialInventoryCount = countInInventory(player, itemFromId(targetItemId));
+                lastKnownCount = initialInventoryCount;
+                ingredientIdx = 0; subStep = 0;
+                enter(State.PLACE_INGREDIENTS);
+                return false;
             }
             if (ticksInState > 40) {
                 emit("craft_failed", "Timed out waiting for crafting screen to open.");
@@ -213,38 +283,67 @@ public class OdysseusDispatcher {
             return false;
         }
 
-        private boolean doClickRecipe(MinecraftClient client, ClientPlayerEntity player, World world) {
-            if (recipeEntry == null) {
-                Item target = itemFromId(targetItemId);
-                if (target == null) {
-                    emit("craft_failed", "Unknown item id: " + targetItemId);
-                    enter(State.CLOSE); return false;
-                }
-                Optional<Object> pick = findRecipeEntryForOutput(player, target);
-                if (pick.isEmpty()) {
-                    emit("craft_failed", "No recipe entry matched " + targetItemId
-                        + " — try !debug_recipes and paste the log.");
-                    enter(State.CLOSE); return false;
-                }
-                recipeEntry = pick.get();
-                OdysseusBridge.LOG.info("[odysseus] using recipe entry: {}", recipeEntry);
-                initialInventoryCount = countInInventory(player, target);
-                lastKnownCount = initialInventoryCount;
-            }
+        private boolean doPlaceIngredients(MinecraftClient client, ClientPlayerEntity player) {
             ScreenHandler h = player.currentScreenHandler;
             ClientPlayerInteractionManager im = client.interactionManager;
-            if (im == null) { emit("craft_failed", "No interaction manager."); enter(State.CLOSE); return false; }
-            boolean ok = tryClickRecipe(im, h.syncId, recipeEntry, true);
-            if (!ok) {
-                emit("craft_failed", "clickRecipe reflection failed — see [odysseus] log.");
+            if (!(h instanceof CraftingScreenHandler) || im == null) {
+                emit("craft_failed", "Crafting screen closed unexpectedly.");
                 enter(State.CLOSE); return false;
             }
-            enter(State.WAIT_FILL);
+            if (ingredientIdx >= recipe.slots.length) {
+                enter(State.TAKE_OUTPUT);
+                return false;
+            }
+            int gridSlot = recipe.slots[ingredientIdx];
+            String ingId = recipe.items[ingredientIdx];
+            Item ingItem = itemFromId("minecraft:" + ingId);
+            if (ingItem == null) {
+                emit("craft_failed", "Unknown ingredient in recipe: " + ingId);
+                enter(State.CLOSE); return false;
+            }
+
+            switch (subStep) {
+                case 0: {
+                    // Find and pick up ingredient from player inventory (slots 10+ in CraftingScreenHandler).
+                    int sourceSlot = findItemSlotInHandler(h, ingItem, 10);
+                    if (sourceSlot < 0) {
+                        emit("craft_failed", "Missing " + ingId + " for " + targetItemKey);
+                        enter(State.CLEAR_GRID);
+                        return false;
+                    }
+                    im.clickSlot(h.syncId, sourceSlot, 0, SlotActionType.PICKUP, player);
+                    subStep = 1;
+                    enter(State.WAIT_STEP);
+                    return false;
+                }
+                case 1: {
+                    // Right-click grid slot to place one.
+                    im.clickSlot(h.syncId, gridSlot, 1, SlotActionType.PICKUP, player);
+                    subStep = 2;
+                    enter(State.WAIT_STEP);
+                    return false;
+                }
+                case 2: {
+                    // Put whatever's on cursor back into inventory (auto-slots to free space).
+                    int cursorReturnSlot = findItemSlotInHandler(h, ingItem, 10);
+                    if (cursorReturnSlot < 0) {
+                        // Cursor is empty (single-item ingredient) or all placed. Skip.
+                        subStep = 0;
+                        ingredientIdx++;
+                        return false;
+                    }
+                    im.clickSlot(h.syncId, cursorReturnSlot, 0, SlotActionType.PICKUP, player);
+                    subStep = 0;
+                    ingredientIdx++;
+                    enter(State.WAIT_STEP);
+                    return false;
+                }
+            }
             return false;
         }
 
-        private boolean doWaitFill(MinecraftClient client, ClientPlayerEntity player) {
-            if (ticksInState >= 2) enter(State.TAKE_OUTPUT);
+        private boolean doWaitStep() {
+            if (ticksInState >= 2) enter(State.PLACE_INGREDIENTS);
             return false;
         }
 
@@ -258,9 +357,11 @@ public class OdysseusDispatcher {
             if (outputStack.isEmpty()) {
                 int haveNow = countInInventory(player, itemFromId(targetItemId));
                 int delta = haveNow - initialInventoryCount;
-                if (delta > 0) emit("craft_ok", "Crafted " + delta + " " + targetItemId + " (inventory now: " + haveNow + ")");
-                else emit("craft_failed", "Grid empty — likely missing ingredients for " + targetItemId);
-                enter(State.CLOSE); return false;
+                if (delta > 0) emit("craft_ok",
+                    "Crafted " + delta + " " + targetItemKey + " (inventory now: " + haveNow + ")");
+                else emit("craft_failed",
+                    "Grid empty — ingredient placement failed for " + targetItemKey);
+                enter(State.CLEAR_GRID); return false;
             }
             ClientPlayerInteractionManager im = client.interactionManager;
             if (im != null) im.clickSlot(h.syncId, 0, 0, SlotActionType.QUICK_MOVE, player);
@@ -268,7 +369,7 @@ public class OdysseusDispatcher {
             return false;
         }
 
-        private boolean doWaitTake(MinecraftClient client, ClientPlayerEntity player) {
+        private boolean doWaitTake() {
             if (ticksInState >= 2) enter(State.CHECK_COUNT);
             return false;
         }
@@ -278,25 +379,48 @@ public class OdysseusDispatcher {
             int haveNow = countInInventory(player, target);
             int crafted = haveNow - initialInventoryCount;
             if (crafted >= targetCount) {
-                emit("craft_ok", "Crafted " + crafted + " " + targetItemId + " (target " + targetCount + ", inventory " + haveNow + ")");
-                enter(State.CLOSE); return false;
+                emit("craft_ok", "Crafted " + crafted + " " + targetItemKey
+                    + " (target " + targetCount + ", inventory " + haveNow + ")");
+                enter(State.CLEAR_GRID); return false;
             }
             if (haveNow == lastKnownCount) {
-                emit("craft_failed", "Stopped at " + crafted + "/" + targetCount + " — no more ingredients for " + targetItemId);
-                enter(State.CLOSE); return false;
+                emit("craft_failed", "Stopped at " + crafted + "/" + targetCount
+                    + " — no more ingredients for " + targetItemKey);
+                enter(State.CLEAR_GRID); return false;
             }
             lastKnownCount = haveNow;
-            enter(State.TAKE_OUTPUT);
+            // Re-place ingredients for the next round.
+            ingredientIdx = 0; subStep = 0;
+            enter(State.PLACE_INGREDIENTS);
+            return false;
+        }
+
+        /** Sweep any leftover items from the crafting grid back to inventory before closing. */
+        private boolean doClearGrid(MinecraftClient client, ClientPlayerEntity player) {
+            ScreenHandler h = player.currentScreenHandler;
+            ClientPlayerInteractionManager im = client.interactionManager;
+            if (!(h instanceof CraftingScreenHandler) || im == null) {
+                enter(State.CLOSE); return false;
+            }
+            for (int i = 1; i <= 9; i++) {
+                if (!h.slots.get(i).getStack().isEmpty()) {
+                    im.clickSlot(h.syncId, i, 0, SlotActionType.QUICK_MOVE, player);
+                }
+            }
+            enter(State.WAIT_CLEAR);
+            return false;
+        }
+
+        private boolean doWaitClear() {
+            if (ticksInState >= 2) enter(State.CLOSE);
             return false;
         }
 
         private boolean doClose(MinecraftClient client, ClientPlayerEntity player) {
-            client.execute(() -> {
-                if (client.player != null && client.player.currentScreenHandler != client.player.playerScreenHandler) {
-                    try { client.player.closeHandledScreen(); } catch (Throwable ignore) {}
-                }
-                client.setScreen(null);
-            });
+            // Just closeHandledScreen — no setScreen(null). Vanilla path, no pause menu.
+            if (player.currentScreenHandler != player.playerScreenHandler) {
+                player.closeHandledScreen();
+            }
             enter(State.DONE);
             return true;
         }
@@ -318,152 +442,14 @@ public class OdysseusDispatcher {
         }
     }
 
-    // ── Recipe lookup — RecipeBook only (client RecipeManager is empty in 1.21.6+) ──
+    // ── Helpers ───────────────────────────────────────────────────────────
 
-    private static Optional<Object> findRecipeEntryForOutput(ClientPlayerEntity player, Item output) {
-        Object book;
-        try { book = player.getRecipeBook(); } catch (Throwable t) { return Optional.empty(); }
-        if (book == null) return Optional.empty();
-        List<?> entries = findFirstListReturn(book);
-        if (entries == null || entries.isEmpty()) {
-            OdysseusBridge.LOG.info("[odysseus] recipe book returned empty/no-list");
-            return Optional.empty();
+    private static int findItemSlotInHandler(ScreenHandler h, Item item, int startFromSlot) {
+        for (int i = startFromSlot; i < h.slots.size(); i++) {
+            ItemStack s = h.slots.get(i).getStack();
+            if (!s.isEmpty() && s.getItem() == item) return i;
         }
-        OdysseusBridge.LOG.info("[odysseus] scanning {} recipe entries for {}", entries.size(), output);
-        for (Object entry : entries) {
-            ItemStack result = extractResultStack(entry);
-            if (result != null && !result.isEmpty() && result.getItem() == output) {
-                return Optional.of(entry);
-            }
-        }
-        return Optional.empty();
-    }
-
-    /** Find the first no-arg method on `obj` returning a List. Cache is unnecessary — one call per craft. */
-    private static List<?> findFirstListReturn(Object obj) {
-        if (obj == null) return null;
-        for (Method m : obj.getClass().getMethods()) {
-            if (m.getParameterCount() != 0) continue;
-            if (m.getReturnType() != List.class) continue;
-            if (m.getDeclaringClass() == Object.class) continue;
-            try {
-                Object r = m.invoke(obj);
-                if (r instanceof List<?>) return (List<?>) r;
-            } catch (Throwable ignore) {}
-        }
-        return null;
-    }
-
-    /** Walk any RecipeDisplayEntry-shaped object looking for an ItemStack result.
-     *  Uses reflection since the RecipeDisplay hierarchy is deeply nested and
-     *  changes every MC version. Two levels deep is enough for all known layouts. */
-    private static ItemStack extractResultStack(Object entry) {
-        if (entry == null) return null;
-        // Level 0: entry itself
-        ItemStack s = firstItemStack(entry);
-        if (s != null) return s;
-        // Level 1: any child object returned by no-arg methods (display, result, output, etc.)
-        for (Method m : entry.getClass().getMethods()) {
-            if (m.getParameterCount() != 0) continue;
-            if (m.getDeclaringClass() == Object.class) continue;
-            Class<?> ret = m.getReturnType();
-            if (ret.isPrimitive() || ret == String.class || ret == Class.class) continue;
-            try {
-                Object child = m.invoke(entry);
-                if (child == null) continue;
-                ItemStack cs = firstItemStack(child);
-                if (cs != null) return cs;
-                // Level 2: dig one more level (display.result.stacks, etc.)
-                for (Method m2 : child.getClass().getMethods()) {
-                    if (m2.getParameterCount() != 0) continue;
-                    if (m2.getDeclaringClass() == Object.class) continue;
-                    Class<?> ret2 = m2.getReturnType();
-                    if (ret2.isPrimitive() || ret2 == String.class || ret2 == Class.class) continue;
-                    try {
-                        Object grand = m2.invoke(child);
-                        if (grand == null) continue;
-                        ItemStack gs = firstItemStack(grand);
-                        if (gs != null) return gs;
-                    } catch (Throwable ignore) {}
-                }
-            } catch (Throwable ignore) {}
-        }
-        return null;
-    }
-
-    /** Return the first non-empty ItemStack accessible via any no-arg method on obj,
-     *  including List<ItemStack> unwrapping. */
-    private static ItemStack firstItemStack(Object obj) {
-        if (obj == null) return null;
-        if (obj instanceof ItemStack) {
-            ItemStack s = (ItemStack) obj;
-            return s.isEmpty() ? null : s;
-        }
-        for (Method m : obj.getClass().getMethods()) {
-            if (m.getParameterCount() != 0) continue;
-            if (m.getDeclaringClass() == Object.class) continue;
-            Class<?> ret = m.getReturnType();
-            if (ret == ItemStack.class) {
-                try {
-                    Object r = m.invoke(obj);
-                    if (r instanceof ItemStack && !((ItemStack) r).isEmpty()) return (ItemStack) r;
-                } catch (Throwable ignore) {}
-            } else if (ret == List.class) {
-                try {
-                    Object r = m.invoke(obj);
-                    if (r instanceof List<?>) {
-                        for (Object o : (List<?>) r) {
-                            if (o instanceof ItemStack && !((ItemStack) o).isEmpty()) return (ItemStack) o;
-                        }
-                    }
-                } catch (Throwable ignore) {}
-            }
-        }
-        return null;
-    }
-
-    /** Try each clickRecipe overload with each of the entry's no-arg return values
-     *  as the second argument. Whichever combo has matching types wins. */
-    private static boolean tryClickRecipe(ClientPlayerInteractionManager im, int syncId, Object recipeEntry, boolean craftAll) {
-        // Gather all candidate "second arg" values from the entry — its id, itself, or nested id-like objects.
-        java.util.List<Object> candidates = new java.util.ArrayList<>();
-        candidates.add(recipeEntry);
-        for (Method m : recipeEntry.getClass().getMethods()) {
-            if (m.getParameterCount() != 0) continue;
-            if (m.getDeclaringClass() == Object.class) continue;
-            Class<?> ret = m.getReturnType();
-            if (ret.isPrimitive() || ret == String.class || ret == Class.class || ret == List.class) continue;
-            try {
-                Object v = m.invoke(recipeEntry);
-                if (v != null) candidates.add(v);
-            } catch (Throwable ignore) {}
-        }
-        for (Method m : im.getClass().getMethods()) {
-            if (!"clickRecipe".equals(m.getName())) continue;
-            Class<?>[] p = m.getParameterTypes();
-            if (p.length != 3) continue;
-            if (!(p[0] == int.class || p[0] == Integer.class)) continue;
-            if (!(p[2] == boolean.class || p[2] == Boolean.class)) continue;
-            for (Object cand : candidates) {
-                if (!p[1].isInstance(cand)) continue;
-                try {
-                    m.invoke(im, syncId, cand, craftAll);
-                    OdysseusBridge.LOG.info("[odysseus] clickRecipe hit with second-arg class {}", cand.getClass().getName());
-                    return true;
-                } catch (Throwable t) {
-                    OdysseusBridge.LOG.warn("[odysseus] clickRecipe throw: {}", t.toString());
-                }
-            }
-        }
-        return false;
-    }
-
-    // ── Misc helpers ──────────────────────────────────────────────────────
-
-    private static String normalizeId(String s) {
-        s = s.trim().toLowerCase();
-        if (!s.contains(":")) s = "minecraft:" + s;
-        return s;
+        return -1;
     }
 
     private static Item itemFromId(String id) {

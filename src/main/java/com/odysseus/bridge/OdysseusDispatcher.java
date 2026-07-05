@@ -335,3 +335,101 @@ public class OdysseusDispatcher {
         private boolean doCheckCount(MinecraftClient client, ClientPlayerEntity player) {
             Item target = itemFromId(targetItemId);
             int haveNow = countInInventory(player, target);
+            int crafted = haveNow - initialInventoryCount;
+            if (crafted >= targetCount) {
+                emit("craft_ok", "Crafted " + crafted + " " + targetItemKey + " (target " + targetCount + ", inventory " + haveNow + ")");
+                enter(State.CLEAR_GRID); return false;
+            }
+            if (haveNow == lastKnownCount) {
+                emit("craft_failed", "Stopped at " + crafted + "/" + targetCount + " — no more ingredients for " + targetItemKey);
+                enter(State.CLEAR_GRID); return false;
+            }
+            lastKnownCount = haveNow;
+            ingredientIdx = 0; subStep = 0; sourceSlotForCurrent = -1;
+            enter(State.PLACE_INGREDIENTS); return false;
+        }
+
+        private boolean doClearGrid(MinecraftClient client, ClientPlayerEntity player) {
+            ScreenHandler h = player.currentScreenHandler;
+            ClientPlayerInteractionManager im = client.interactionManager;
+            if (!(h instanceof CraftingScreenHandler) || im == null) { enter(State.CLOSE); return false; }
+            for (int i = 1; i <= 9; i++) {
+                if (!h.slots.get(i).getStack().isEmpty()) {
+                    im.clickSlot(h.syncId, i, 0, SlotActionType.QUICK_MOVE, player);
+                }
+            }
+            enter(State.WAIT_CLEAR); return false;
+        }
+
+        private boolean doWaitClear() {
+            if (ticksInState >= 2) enter(State.CLOSE);
+            return false;
+        }
+
+        private boolean doClose(MinecraftClient client, ClientPlayerEntity player) {
+            OdysseusBridge.LOG.info("[odysseus] doClose — closing screen and arming pause-menu guard");
+            suppressPauseMenuTicks = 40;
+            client.execute(() -> {
+                if (client.currentScreen != null) {
+                    client.currentScreen.close();
+                } else if (player.currentScreenHandler != player.playerScreenHandler) {
+                    player.closeHandledScreen();
+                }
+            });
+            enter(State.DONE);
+            return true;
+        }
+    }
+
+    private static class UseHeldTask implements Task {
+        @Override public String name() { return "use held item"; }
+        @Override
+        public boolean tick(MinecraftClient client) {
+            ClientPlayerEntity player = client.player;
+            if (player == null || client.interactionManager == null) {
+                emit("use_failed", "No player/interaction manager."); return true;
+            }
+            client.interactionManager.interactItem(player, Hand.MAIN_HAND);
+            emit("use_ok", "Used held item.");
+            return true;
+        }
+    }
+
+    private static int findItemSlotInHandler(ScreenHandler h, Item item, int startFromSlot) {
+        for (int i = startFromSlot; i < h.slots.size(); i++) {
+            ItemStack s = h.slots.get(i).getStack();
+            if (!s.isEmpty() && s.getItem() == item) return i;
+        }
+        return -1;
+    }
+
+    private static Item itemFromId(String id) {
+        try {
+            Identifier ident = Identifier.tryParse(id);
+            if (ident == null) return null;
+            Item item = Registries.ITEM.get(ident);
+            return (item == null || item == net.minecraft.item.Items.AIR) ? null : item;
+        } catch (Throwable t) { return null; }
+    }
+
+    private static int countInInventory(ClientPlayerEntity player, Item item) {
+        if (item == null) return 0;
+        PlayerInventory inv = player.getInventory();
+        int total = 0;
+        for (int i = 0; i < inv.size(); i++) {
+            ItemStack s = inv.getStack(i);
+            if (!s.isEmpty() && s.getItem() == item) total += s.getCount();
+        }
+        return total;
+    }
+
+    private static int parseIntOr(String s, int fallback) {
+        try { return Integer.parseInt(s); } catch (NumberFormatException e) { return fallback; }
+    }
+
+    private static void emit(String event, String text) {
+        OdysseusBridge.LOG.info("[odysseus] {} : {}", event, text);
+        BridgeClient c = OdysseusBridge.getClient();
+        if (c != null) c.sendEvent(event, text);
+    }
+}

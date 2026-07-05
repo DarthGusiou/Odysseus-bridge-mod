@@ -24,20 +24,18 @@ import net.minecraft.world.World;
 import java.lang.reflect.Method;
 import java.util.HashMap;
 import java.util.Map;
-import java.util.Optional;
 
 public class OdysseusDispatcher {
     private static volatile Task currentTask;
     private static String lastScreenClass = "<init>";
     private static int suppressPauseMenuTicks = 0;
 
-    // Baritone state polling — detects when any process transitions from
-    // active → idle so we can emit goal_reached even when Baritone stays
-    // silent on arrival. Debounced to filter mid-path re-planning.
+    // Baritone process polling — detects idle transitions so #goto arrivals fire
+    // goal_reached even when Baritone stays silent.
     private static Boolean lastBaritoneActive = null;
     private static int baritoneIdleTicks = 0;
     private static boolean baritoneCompletionEmitted = false;
-    private static final int BARITONE_IDLE_DEBOUNCE_TICKS = 20;   // ~1 second
+    private static final int BARITONE_IDLE_DEBOUNCE_TICKS = 20;
 
     public static void register() {
         ClientTickEvents.END_CLIENT_TICK.register(OdysseusDispatcher::onTick);
@@ -76,20 +74,15 @@ public class OdysseusDispatcher {
         }
     }
 
-    /** Poll Baritone's active-process state. On the debounced active → idle
-     *  transition, emit a goal_reached event so the pilot loop can react even
-     *  when Baritone stays silent on arrival. */
     private static void onBaritoneMonitorTick(MinecraftClient client) {
         Boolean nowActive = queryBaritoneActive();
-        if (nowActive == null) return;   // Baritone unreachable — nothing to do
+        if (nowActive == null) return;
         if (nowActive) {
-            // Something is running. Reset debounce and remember we're active.
             lastBaritoneActive = true;
             baritoneIdleTicks = 0;
             baritoneCompletionEmitted = false;
             return;
         }
-        // Not active right now. Only care if we WERE active before.
         if (!Boolean.TRUE.equals(lastBaritoneActive)) return;
         if (baritoneCompletionEmitted) return;
         baritoneIdleTicks++;
@@ -101,27 +94,21 @@ public class OdysseusDispatcher {
         }
     }
 
-    /** Reflection: returns TRUE if any Baritone process is currently in control,
-     *  FALSE if idle, null if Baritone or the classes we need aren't loaded. */
     private static Boolean queryBaritoneActive() {
         try {
             Class<?> apiClass = Class.forName("baritone.api.BaritoneAPI");
             Object provider = apiClass.getMethod("getProvider").invoke(null);
             Object primary  = provider.getClass().getMethod("getPrimaryBaritone").invoke(provider);
-            // Preferred: ask the PathingControlManager who's in control right now.
             try {
                 Object pcm = primary.getClass().getMethod("getPathingControlManager").invoke(primary);
                 Object opt = pcm.getClass().getMethod("mostRecentInControl").invoke(pcm);
                 if (opt instanceof java.util.Optional<?>) {
                     return ((java.util.Optional<?>) opt).isPresent();
                 }
-                // Some forks return their own optional-like wrapper — probe for isPresent()
                 Method isPresent = opt.getClass().getMethod("isPresent");
                 Object r = isPresent.invoke(opt);
                 if (r instanceof Boolean) return (Boolean) r;
-            } catch (Throwable ignored) {
-                // Older API — fall through to pathingBehavior.isPathing()
-            }
+            } catch (Throwable ignored) {}
             Object pathing = primary.getClass().getMethod("getPathingBehavior").invoke(primary);
             Object r = pathing.getClass().getMethod("isPathing").invoke(pathing);
             return (r instanceof Boolean) ? (Boolean) r : null;
@@ -148,6 +135,10 @@ public class OdysseusDispatcher {
                 if (parts.length < 2) { emit("craft_failed", "Usage: !craft <item> [count]"); return; }
                 String item = parts[1];
                 int count = parts.length >= 3 ? parseIntOr(parts[2], 1) : 1;
+                if (count < 1 || count > 999) {
+                    emit("craft_failed", "Invalid count " + count + " (must be 1-999).");
+                    return;
+                }
                 currentTask = new CraftTask(item, count);
                 return;
             case "use":
@@ -233,6 +224,10 @@ public class OdysseusDispatcher {
         private int lastKnownCount = -1;
         private int ingredientIdx = 0;
         private int subStep = 0;
+        // v0.1.13: remember which slot we picked from so we can drop the leftover
+        // back into it (which is now empty). Fixes the bug where an ingredient
+        // fills the cursor and the next ingredient can't find its inventory item.
+        private int sourceSlotForCurrent = -1;
 
         enum State {
             FIND_TABLE, WAIT_SCREEN, PLACE_INGREDIENTS, WAIT_STEP, TAKE_OUTPUT, WAIT_TAKE,
@@ -282,7 +277,7 @@ public class OdysseusDispatcher {
             if (player.currentScreenHandler instanceof CraftingScreenHandler) {
                 initialInventoryCount = countInInventory(player, itemFromId(targetItemId));
                 lastKnownCount = initialInventoryCount;
-                ingredientIdx = 0; subStep = 0;
+                ingredientIdx = 0; subStep = 0; sourceSlotForCurrent = -1;
                 enter(State.PLACE_INGREDIENTS); return false;
             }
             BlockPos here = player.getBlockPos();
@@ -310,7 +305,7 @@ public class OdysseusDispatcher {
             if (player.currentScreenHandler instanceof CraftingScreenHandler) {
                 initialInventoryCount = countInInventory(player, itemFromId(targetItemId));
                 lastKnownCount = initialInventoryCount;
-                ingredientIdx = 0; subStep = 0;
+                ingredientIdx = 0; subStep = 0; sourceSlotForCurrent = -1;
                 enter(State.PLACE_INGREDIENTS); return false;
             }
             if (ticksInState > 40) {
@@ -337,23 +332,35 @@ public class OdysseusDispatcher {
             }
             switch (subStep) {
                 case 0: {
+                    // Find the source stack in the player-inventory portion of the
+                    // handler (slots 10+). Remember it so subStep 2 can drop the
+                    // leftover back into the (now empty) same slot.
                     int sourceSlot = findItemSlotInHandler(h, ingItem, 10);
                     if (sourceSlot < 0) {
                         emit("craft_failed", "Missing " + ingId + " for " + targetItemKey);
                         enter(State.CLEAR_GRID); return false;
                     }
+                    sourceSlotForCurrent = sourceSlot;
                     im.clickSlot(h.syncId, sourceSlot, 0, SlotActionType.PICKUP, player);
                     subStep = 1; enter(State.WAIT_STEP); return false;
                 }
                 case 1: {
+                    // Right-click grid slot → drops exactly one item from cursor.
                     im.clickSlot(h.syncId, gridSlot, 1, SlotActionType.PICKUP, player);
                     subStep = 2; enter(State.WAIT_STEP); return false;
                 }
                 case 2: {
-                    int cursorReturnSlot = findItemSlotInHandler(h, ingItem, 10);
-                    if (cursorReturnSlot < 0) { subStep = 0; ingredientIdx++; return false; }
-                    im.clickSlot(h.syncId, cursorReturnSlot, 0, SlotActionType.PICKUP, player);
-                    subStep = 0; ingredientIdx++; enter(State.WAIT_STEP); return false;
+                    // Return the leftover on cursor to the SAME slot we picked from
+                    // (which is now empty). This keeps the ingredient available in
+                    // inventory for the next ingredient — the previous bug was
+                    // that we skipped this step whenever nothing else in the
+                    // inventory had matching items, leaving cursor stuck.
+                    if (sourceSlotForCurrent >= 0) {
+                        im.clickSlot(h.syncId, sourceSlotForCurrent, 0, SlotActionType.PICKUP, player);
+                    }
+                    sourceSlotForCurrent = -1;
+                    subStep = 0; ingredientIdx++;
+                    enter(State.WAIT_STEP); return false;
                 }
             }
             return false;
@@ -401,7 +408,7 @@ public class OdysseusDispatcher {
                 enter(State.CLEAR_GRID); return false;
             }
             lastKnownCount = haveNow;
-            ingredientIdx = 0; subStep = 0;
+            ingredientIdx = 0; subStep = 0; sourceSlotForCurrent = -1;
             enter(State.PLACE_INGREDIENTS); return false;
         }
 
@@ -424,7 +431,9 @@ public class OdysseusDispatcher {
 
         private boolean doClose(MinecraftClient client, ClientPlayerEntity player) {
             OdysseusBridge.LOG.info("[odysseus] doClose — closing screen and arming pause-menu guard");
-            suppressPauseMenuTicks = 20;
+            // Bumped 20 → 40 ticks (2 sec). Some close paths open the pause menu
+            // later than 1 second and the previous guard duration missed them.
+            suppressPauseMenuTicks = 40;
             client.execute(() -> {
                 if (client.currentScreen != null) {
                     client.currentScreen.close();

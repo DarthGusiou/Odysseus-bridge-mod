@@ -21,7 +21,6 @@ import net.minecraft.util.math.Direction;
 import net.minecraft.util.math.Vec3d;
 import net.minecraft.world.World;
 
-import java.lang.reflect.Method;
 import java.util.HashMap;
 import java.util.Map;
 
@@ -30,18 +29,17 @@ public class OdysseusDispatcher {
     private static String lastScreenClass = "<init>";
     private static int suppressPauseMenuTicks = 0;
 
-    // Baritone process polling — detects idle transitions so #goto arrivals fire
-    // goal_reached even when Baritone stays silent.
-    private static Boolean lastBaritoneActive = null;
-    private static int baritoneIdleTicks = 0;
-    private static boolean baritoneCompletionEmitted = false;
-    private static final int BARITONE_IDLE_DEBOUNCE_TICKS = 20;
-
     public static void register() {
         ClientTickEvents.END_CLIENT_TICK.register(OdysseusDispatcher::onTick);
         ClientTickEvents.END_CLIENT_TICK.register(OdysseusDispatcher::onScreenMonitorTick);
         ClientTickEvents.END_CLIENT_TICK.register(OdysseusDispatcher::onPauseMenuGuardTick);
-        ClientTickEvents.END_CLIENT_TICK.register(OdysseusDispatcher::onBaritoneMonitorTick);
+        // NOTE: Baritone state polling was REMOVED in v0.1.14. Doing reflection
+        // calls into Baritone's PathingControlManager on the render thread every
+        // tick caused deadlocks against Baritone's internal locks held by its
+        // pathfinder worker threads — MC would hang with the rainbow cursor on
+        // macOS. Arrival detection falls back to Baritone's chat messages
+        // (enable via `#set notificationOnPathComplete true` in-game), which
+        // Odysseus already matches with its expanded terminal-text patterns.
     }
 
     private static void onTick(MinecraftClient client) {
@@ -71,51 +69,6 @@ public class OdysseusDispatcher {
             OdysseusBridge.LOG.info("[odysseus] auto-dismissing GameMenuScreen after craft close");
             client.setScreen(null);
             suppressPauseMenuTicks = 0;
-        }
-    }
-
-    private static void onBaritoneMonitorTick(MinecraftClient client) {
-        Boolean nowActive = queryBaritoneActive();
-        if (nowActive == null) return;
-        if (nowActive) {
-            lastBaritoneActive = true;
-            baritoneIdleTicks = 0;
-            baritoneCompletionEmitted = false;
-            return;
-        }
-        if (!Boolean.TRUE.equals(lastBaritoneActive)) return;
-        if (baritoneCompletionEmitted) return;
-        baritoneIdleTicks++;
-        if (baritoneIdleTicks >= BARITONE_IDLE_DEBOUNCE_TICKS) {
-            baritoneCompletionEmitted = true;
-            lastBaritoneActive = false;
-            OdysseusBridge.LOG.info("[odysseus] baritone: process completed (idle {} ticks)", baritoneIdleTicks);
-            emit("goal_reached", "Pathing complete");
-        }
-    }
-
-    private static Boolean queryBaritoneActive() {
-        try {
-            Class<?> apiClass = Class.forName("baritone.api.BaritoneAPI");
-            Object provider = apiClass.getMethod("getProvider").invoke(null);
-            Object primary  = provider.getClass().getMethod("getPrimaryBaritone").invoke(provider);
-            try {
-                Object pcm = primary.getClass().getMethod("getPathingControlManager").invoke(primary);
-                Object opt = pcm.getClass().getMethod("mostRecentInControl").invoke(pcm);
-                if (opt instanceof java.util.Optional<?>) {
-                    return ((java.util.Optional<?>) opt).isPresent();
-                }
-                Method isPresent = opt.getClass().getMethod("isPresent");
-                Object r = isPresent.invoke(opt);
-                if (r instanceof Boolean) return (Boolean) r;
-            } catch (Throwable ignored) {}
-            Object pathing = primary.getClass().getMethod("getPathingBehavior").invoke(primary);
-            Object r = pathing.getClass().getMethod("isPathing").invoke(pathing);
-            return (r instanceof Boolean) ? (Boolean) r : null;
-        } catch (ClassNotFoundException notFound) {
-            return null;
-        } catch (Throwable t) {
-            return null;
         }
     }
 
@@ -158,8 +111,6 @@ public class OdysseusDispatcher {
         boolean tick(MinecraftClient client);
         String name();
     }
-
-    // ── Hardcoded recipe map ──────────────────────────────────────────────
 
     private static class RecipeSpec {
         final int outputCount;
@@ -210,8 +161,6 @@ public class OdysseusDispatcher {
             new String[]{"cobblestone","cobblestone","stick"}));
     }
 
-    // ── Craft task ────────────────────────────────────────────────────────
-
     private static class CraftTask implements Task {
         private final String targetItemId;
         private final String targetItemKey;
@@ -224,9 +173,6 @@ public class OdysseusDispatcher {
         private int lastKnownCount = -1;
         private int ingredientIdx = 0;
         private int subStep = 0;
-        // v0.1.13: remember which slot we picked from so we can drop the leftover
-        // back into it (which is now empty). Fixes the bug where an ingredient
-        // fills the cursor and the next ingredient can't find its inventory item.
         private int sourceSlotForCurrent = -1;
 
         enum State {
@@ -332,9 +278,6 @@ public class OdysseusDispatcher {
             }
             switch (subStep) {
                 case 0: {
-                    // Find the source stack in the player-inventory portion of the
-                    // handler (slots 10+). Remember it so subStep 2 can drop the
-                    // leftover back into the (now empty) same slot.
                     int sourceSlot = findItemSlotInHandler(h, ingItem, 10);
                     if (sourceSlot < 0) {
                         emit("craft_failed", "Missing " + ingId + " for " + targetItemKey);
@@ -345,16 +288,10 @@ public class OdysseusDispatcher {
                     subStep = 1; enter(State.WAIT_STEP); return false;
                 }
                 case 1: {
-                    // Right-click grid slot → drops exactly one item from cursor.
                     im.clickSlot(h.syncId, gridSlot, 1, SlotActionType.PICKUP, player);
                     subStep = 2; enter(State.WAIT_STEP); return false;
                 }
                 case 2: {
-                    // Return the leftover on cursor to the SAME slot we picked from
-                    // (which is now empty). This keeps the ingredient available in
-                    // inventory for the next ingredient — the previous bug was
-                    // that we skipped this step whenever nothing else in the
-                    // inventory had matching items, leaving cursor stuck.
                     if (sourceSlotForCurrent >= 0) {
                         im.clickSlot(h.syncId, sourceSlotForCurrent, 0, SlotActionType.PICKUP, player);
                     }
@@ -398,107 +335,3 @@ public class OdysseusDispatcher {
         private boolean doCheckCount(MinecraftClient client, ClientPlayerEntity player) {
             Item target = itemFromId(targetItemId);
             int haveNow = countInInventory(player, target);
-            int crafted = haveNow - initialInventoryCount;
-            if (crafted >= targetCount) {
-                emit("craft_ok", "Crafted " + crafted + " " + targetItemKey + " (target " + targetCount + ", inventory " + haveNow + ")");
-                enter(State.CLEAR_GRID); return false;
-            }
-            if (haveNow == lastKnownCount) {
-                emit("craft_failed", "Stopped at " + crafted + "/" + targetCount + " — no more ingredients for " + targetItemKey);
-                enter(State.CLEAR_GRID); return false;
-            }
-            lastKnownCount = haveNow;
-            ingredientIdx = 0; subStep = 0; sourceSlotForCurrent = -1;
-            enter(State.PLACE_INGREDIENTS); return false;
-        }
-
-        private boolean doClearGrid(MinecraftClient client, ClientPlayerEntity player) {
-            ScreenHandler h = player.currentScreenHandler;
-            ClientPlayerInteractionManager im = client.interactionManager;
-            if (!(h instanceof CraftingScreenHandler) || im == null) { enter(State.CLOSE); return false; }
-            for (int i = 1; i <= 9; i++) {
-                if (!h.slots.get(i).getStack().isEmpty()) {
-                    im.clickSlot(h.syncId, i, 0, SlotActionType.QUICK_MOVE, player);
-                }
-            }
-            enter(State.WAIT_CLEAR); return false;
-        }
-
-        private boolean doWaitClear() {
-            if (ticksInState >= 2) enter(State.CLOSE);
-            return false;
-        }
-
-        private boolean doClose(MinecraftClient client, ClientPlayerEntity player) {
-            OdysseusBridge.LOG.info("[odysseus] doClose — closing screen and arming pause-menu guard");
-            // Bumped 20 → 40 ticks (2 sec). Some close paths open the pause menu
-            // later than 1 second and the previous guard duration missed them.
-            suppressPauseMenuTicks = 40;
-            client.execute(() -> {
-                if (client.currentScreen != null) {
-                    client.currentScreen.close();
-                } else if (player.currentScreenHandler != player.playerScreenHandler) {
-                    player.closeHandledScreen();
-                }
-            });
-            enter(State.DONE);
-            return true;
-        }
-    }
-
-    // ── Use held item ─────────────────────────────────────────────────────
-
-    private static class UseHeldTask implements Task {
-        @Override public String name() { return "use held item"; }
-        @Override
-        public boolean tick(MinecraftClient client) {
-            ClientPlayerEntity player = client.player;
-            if (player == null || client.interactionManager == null) {
-                emit("use_failed", "No player/interaction manager."); return true;
-            }
-            client.interactionManager.interactItem(player, Hand.MAIN_HAND);
-            emit("use_ok", "Used held item.");
-            return true;
-        }
-    }
-
-    // ── Helpers ───────────────────────────────────────────────────────────
-
-    private static int findItemSlotInHandler(ScreenHandler h, Item item, int startFromSlot) {
-        for (int i = startFromSlot; i < h.slots.size(); i++) {
-            ItemStack s = h.slots.get(i).getStack();
-            if (!s.isEmpty() && s.getItem() == item) return i;
-        }
-        return -1;
-    }
-
-    private static Item itemFromId(String id) {
-        try {
-            Identifier ident = Identifier.tryParse(id);
-            if (ident == null) return null;
-            Item item = Registries.ITEM.get(ident);
-            return (item == null || item == net.minecraft.item.Items.AIR) ? null : item;
-        } catch (Throwable t) { return null; }
-    }
-
-    private static int countInInventory(ClientPlayerEntity player, Item item) {
-        if (item == null) return 0;
-        PlayerInventory inv = player.getInventory();
-        int total = 0;
-        for (int i = 0; i < inv.size(); i++) {
-            ItemStack s = inv.getStack(i);
-            if (!s.isEmpty() && s.getItem() == item) total += s.getCount();
-        }
-        return total;
-    }
-
-    private static int parseIntOr(String s, int fallback) {
-        try { return Integer.parseInt(s); } catch (NumberFormatException e) { return fallback; }
-    }
-
-    private static void emit(String event, String text) {
-        OdysseusBridge.LOG.info("[odysseus] {} : {}", event, text);
-        BridgeClient c = OdysseusBridge.getClient();
-        if (c != null) c.sendEvent(event, text);
-    }
-}

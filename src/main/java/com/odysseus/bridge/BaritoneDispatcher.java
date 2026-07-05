@@ -1,61 +1,59 @@
 package com.odysseus.bridge;
 
 import net.minecraft.client.MinecraftClient;
-import java.lang.reflect.Method;
+import net.minecraft.client.network.ClientPlayNetworkHandler;
+import net.minecraft.client.network.ClientPlayerEntity;
 
 /**
- * Runs Baritone commands without a compile-time dependency on Baritone.
- * Uses reflection so a single jar works with any Fabric Baritone fork
- * (Baritone-Meteor, Cabaletta upstream, etc.) as long as
- * `baritone.api.BaritoneAPI` is on the classpath at runtime.
+ * Sends Baritone commands to the local client by injecting them as chat
+ * messages. Baritone's own {@code ExampleBaritoneControl} intercepts
+ * outgoing chat messages that begin with its command prefix ({@code #} by
+ * default), cancels the send so nothing reaches the server, and dispatches
+ * to its command manager — the exact path a user typing in chat takes.
  *
- * Nothing goes through server chat — the command is dispatched directly
- * to Baritone's ICommandManager on the main thread.
+ * Why not reflection into {@code baritone.api.BaritoneAPI}: cross-mod
+ * {@code Class.forName} kept throwing {@code ClassNotFoundException} on
+ * this setup even with the standalone Baritone jar installed and the
+ * Knot classloader passed explicitly. Chat injection sidesteps the
+ * classloader question entirely and has fewer moving parts.
  */
 public class BaritoneDispatcher {
 
-    /** Execute a Baritone command string, e.g. "goto 100 64 -50" or "stop". */
+    /** Execute a Baritone command string, e.g. "mine 6 oak_log" or "goto 100 64 -50". */
     public static void execute(String command) {
         if (command == null || command.isBlank()) return;
         String cmd = command.trim();
-        if (cmd.startsWith("#")) cmd = cmd.substring(1);
+        // Baritone's chat interceptor requires the # prefix. Add if missing so
+        // callers can pass either form.
+        if (!cmd.startsWith("#")) cmd = "#" + cmd;
 
         MinecraftClient mc = MinecraftClient.getInstance();
         if (mc == null) {
-            OdysseusBridge.LOG.warn("Dropped Baritone cmd — MC not initialized: {}", cmd);
+            OdysseusBridge.LOG.warn("Dropped Baritone cmd — MC not initialized: {}", command);
             return;
         }
 
         final String finalCmd = cmd;
-        // Use MinecraftClient's classloader (Fabric's Knot) so cross-mod
-        // reflection can see Baritone. Class.forName(name) uses the caller's
-        // module classloader which, from inside a mc.execute() lambda, is not
-        // guaranteed to be Knot — reflection then fails with
-        // ClassNotFoundException even when Baritone is fully installed.
-        final ClassLoader cl = MinecraftClient.class.getClassLoader();
         mc.execute(() -> {
+            ClientPlayerEntity player = mc.player;
+            if (player == null) {
+                OdysseusBridge.LOG.warn("Dropped Baritone cmd — no player: {}", finalCmd);
+                return;
+            }
+            ClientPlayNetworkHandler net = player.networkHandler;
+            if (net == null) {
+                OdysseusBridge.LOG.warn("Dropped Baritone cmd — no network handler: {}", finalCmd);
+                return;
+            }
             try {
-                Class<?> apiClass    = Class.forName("baritone.api.BaritoneAPI", true, cl);
-                Object   provider    = apiClass.getMethod("getProvider").invoke(null);
-                Object   primary     = provider.getClass().getMethod("getPrimaryBaritone").invoke(provider);
-                Object   cmdManager  = primary.getClass().getMethod("getCommandManager").invoke(primary);
-                Method   execute     = findExecuteMethod(cmdManager.getClass());
-                Object   result      = execute.invoke(cmdManager, finalCmd);
-                OdysseusBridge.LOG.info("Baritone.execute({}) -> {}", finalCmd, result);
-            } catch (ClassNotFoundException notFound) {
-                OdysseusBridge.LOG.warn("Baritone not on classpath — is a Baritone Fabric mod installed?");
+                // Baritone mixes into the outgoing-chat pipeline and cancels
+                // messages beginning with its prefix, so this never leaves
+                // the client and never appears in chat/server logs.
+                net.sendChatMessage(finalCmd);
+                OdysseusBridge.LOG.info("Baritone chat-inject: {}", finalCmd);
             } catch (Throwable t) {
-                OdysseusBridge.LOG.warn("Baritone command failed [{}]: {}", finalCmd, t.toString());
+                OdysseusBridge.LOG.warn("Baritone chat-inject failed [{}]: {}", finalCmd, t.toString());
             }
         });
-    }
-
-    private static Method findExecuteMethod(Class<?> mgrClass) throws NoSuchMethodException {
-        for (Method m : mgrClass.getMethods()) {
-            if (!"execute".equals(m.getName())) continue;
-            Class<?>[] p = m.getParameterTypes();
-            if (p.length == 1 && p[0] == String.class) return m;
-        }
-        throw new NoSuchMethodException("No execute(String) on " + mgrClass.getName());
     }
 }

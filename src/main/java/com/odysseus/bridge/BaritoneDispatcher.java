@@ -27,9 +27,15 @@ public class BaritoneDispatcher {
         }
 
         final String finalCmd = cmd;
+        // Use MinecraftClient's classloader (Fabric's Knot) so cross-mod
+        // reflection can see Baritone. Class.forName(name) uses the caller's
+        // module classloader which, from inside a mc.execute() lambda, is not
+        // guaranteed to be Knot — reflection then fails with
+        // ClassNotFoundException even when Baritone is fully installed.
+        final ClassLoader cl = MinecraftClient.class.getClassLoader();
         mc.execute(() -> {
             try {
-                Class<?> apiClass    = Class.forName("baritone.api.BaritoneAPI");
+                Class<?> apiClass    = Class.forName("baritone.api.BaritoneAPI", true, cl);
                 Object   provider    = apiClass.getMethod("getProvider").invoke(null);
                 Object   primary     = provider.getClass().getMethod("getPrimaryBaritone").invoke(provider);
                 Object   cmdManager  = primary.getClass().getMethod("getCommandManager").invoke(primary);

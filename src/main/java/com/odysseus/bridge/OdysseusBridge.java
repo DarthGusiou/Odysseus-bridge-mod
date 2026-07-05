@@ -1,5 +1,7 @@
 package com.odysseus.bridge;
 
+import com.google.gson.Gson;
+import com.google.gson.JsonObject;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.loader.api.FabricLoader;
 
@@ -21,12 +23,17 @@ import org.slf4j.LoggerFactory;
  */
 public class OdysseusBridge implements ClientModInitializer {
     public static final String MOD_ID   = "odysseus-bridge";
-    public static final String VERSION  = "0.1.14";
+    public static final String VERSION  = "0.1.15";
     public static final String DEFAULT_URL = "ws://127.0.0.1:7860/api/minecraft/copilot_bridge";
 
     public static final Logger LOG = LoggerFactory.getLogger(MOD_ID);
 
     private static BridgeClient client;
+
+    /** Structured event envelope prefix — see docs at
+     *  github.com/DarthGusiou/Minecraft-AI/blob/1.21.8-minecraft-AI/docs/odysseus-events.md */
+    private static final String STRUCTURED_PREFIX = "[ODY]";
+    private static final Gson GSON = new Gson();
 
     /** Called by OdysseusDispatcher to send status back to Odysseus. */
     public static BridgeClient getClient() { return client; }
@@ -45,7 +52,45 @@ public class OdysseusBridge implements ClientModInitializer {
         // Register the tick pump that runs OdysseusDispatcher's task state machines.
         OdysseusDispatcher.register();
 
-        LOG.info("Odysseus Bridge {} initialized. Chat interception via ChatHud mixin. Custom commands enabled (!craft, ...).", VERSION);
+        LOG.info("Odysseus Bridge {} initialized. Chat interception + structured [ODY] event handling enabled.", VERSION);
+    }
+
+    /**
+     * Detect + consume a structured Odysseus event embedded in a chat message.
+     * Returns true if the message was a valid Odysseus envelope AND was forwarded;
+     * caller should then cancel chat rendering. Returns false otherwise so the
+     * caller can fall through to the legacy path-string matcher.
+     *
+     * Matches any text whose first non-whitespace token begins with "[ODY]" —
+     * this way the check tolerates any leading formatting characters Baritone
+     * may prepend (color codes, styling, etc.). The payload after "[ODY]" must
+     * parse as a JSON object with both `schema_version` and `type` fields, or
+     * we treat it as coincidence and fall through.
+     */
+    public static boolean tryHandleStructuredEvent(String text) {
+        if (text == null || client == null) return false;
+        int prefixIdx = text.indexOf(STRUCTURED_PREFIX);
+        // Prefix must be near the start — bail early on regular chat that
+        // happens to mention "[ODY]" mid-message.
+        if (prefixIdx < 0 || prefixIdx > 4) return false;
+        String rest = text.substring(prefixIdx + STRUCTURED_PREFIX.length()).trim();
+        int jsonStart = rest.indexOf('{');
+        if (jsonStart < 0) return false;
+        String jsonSlice = rest.substring(jsonStart);
+        try {
+            JsonObject env = GSON.fromJson(jsonSlice, JsonObject.class);
+            if (env == null || !env.has("schema_version") || !env.has("type")) {
+                return false;
+            }
+            String type = env.get("type").getAsString();
+            LOG.info("[bridge-struct] {} → {}", type,
+                     env.has("message") ? env.get("message").getAsString() : "");
+            client.sendStructuredEvent(env);
+            return true;
+        } catch (Throwable t) {
+            LOG.warn("[bridge-struct] parse failed for '{}': {}", jsonSlice, t.toString());
+            return false;
+        }
     }
 
     /** Called from ChatHudMixin for every message the chat overlay renders. */

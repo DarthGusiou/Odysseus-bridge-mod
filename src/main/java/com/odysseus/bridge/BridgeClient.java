@@ -125,4 +125,21 @@ public class BridgeClient {
         msg.addProperty("text", text);
         s.send(msg.toString());
     }
+
+    /**
+     * Forward a structured Odysseus event to the Odysseus backend. The
+     * envelope contents are wrapped in a message of type "odysseus_structured"
+     * so the backend WS handler can route it distinctly from legacy
+     * "baritone_event" messages (which stay in place for the migration window).
+     *
+     * See docs/odysseus-events.md for the envelope schema.
+     */
+    public void sendStructuredEvent(JsonObject envelope) {
+        WebSocketClient s = this.socket;
+        if (s == null || !s.isOpen() || envelope == null) return;
+        JsonObject msg = new JsonObject();
+        msg.addProperty("type", "odysseus_structured");
+        msg.add("event", envelope);
+        s.send(msg.toString());
+    }
 }

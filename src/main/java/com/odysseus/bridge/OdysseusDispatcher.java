@@ -310,6 +310,14 @@ public class OdysseusDispatcher {
                 emit("craft_failed", "No hardcoded recipe for " + targetItemKey + " — run !recipes to see supported ones.");
                 enter(State.DONE); return true;
             }
+            // Target-total semantics: if the player already has enough, no-op.
+            // Matches !craft prompt contract ("count = final inventory target").
+            // Also saves ingredients when the AI double-dispatches by mistake.
+            int haveInit = countInInventory(player, itemFromId(targetItemId));
+            if (haveInit >= targetCount) {
+                emit("craft_ok", "Already have " + haveInit + " " + targetItemKey + " (target " + targetCount + ") — no crafting needed.");
+                enter(State.DONE); return true;
+            }
             if (player.currentScreenHandler instanceof CraftingScreenHandler) {
                 initialInventoryCount = countInInventory(player, itemFromId(targetItemId));
                 lastKnownCount = initialInventoryCount;
@@ -426,12 +434,15 @@ public class OdysseusDispatcher {
             Item target = itemFromId(targetItemId);
             int haveNow = countInInventory(player, target);
             int crafted = haveNow - initialInventoryCount;
-            if (crafted >= targetCount) {
+            // Total semantics: stop when inventory hits the target, not when
+            // this run's delta hits it. Prevents !craft stone_axe 1 (when
+            // you already have 1) from ending at inventory 2.
+            if (haveNow >= targetCount) {
                 emit("craft_ok", "Crafted " + crafted + " " + targetItemKey + " (target " + targetCount + ", inventory " + haveNow + ")");
                 enter(State.CLEAR_GRID); return false;
             }
             if (haveNow == lastKnownCount) {
-                emit("craft_failed", "Stopped at " + crafted + "/" + targetCount + " — no more ingredients for " + targetItemKey);
+                emit("craft_failed", "Stopped at inventory " + haveNow + "/" + targetCount + " — no more ingredients for " + targetItemKey);
                 enter(State.CLEAR_GRID); return false;
             }
             lastKnownCount = haveNow;

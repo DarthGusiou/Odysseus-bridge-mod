@@ -105,43 +105,42 @@ public class OdysseusDispatcher {
                     emit("craft_failed", "Invalid count " + count + " (must be 1-999).");
                     return;
                 }
-                // Prefer the personal 2x2 grid when there's no table nearby AND
-                // the recipe fits in 2x2. Silently transparent to the caller —
-                // the model doesn't care which container was used, just the
-                // outcome. Falls back to the standard table path otherwise.
+                // Always prefer the personal 2x2 grid when the recipe fits —
+                // saves the round-trip of opening/closing a nearby table for
+                // simple recipes (planks, sticks, torches, crafting_table).
+                // Only recipes that require the full 3x3 grid (chest, furnace,
+                // iron tools, armor) fall back to the table path.
                 String norm = item.trim().toLowerCase();
                 if (norm.startsWith("minecraft:")) norm = norm.substring("minecraft:".length());
                 RecipeSpec rSpec = RECIPES.get(norm);
-                boolean tableNearby = MinecraftClient.getInstance() != null
-                                      && MinecraftClient.getInstance().player != null
-                                      && MinecraftClient.getInstance().world != null
-                                      && findCraftingTableNear(MinecraftClient.getInstance().player,
-                                                               MinecraftClient.getInstance().world) != null;
-                boolean use2x2 = !tableNearby && fitsPersonalGrid(rSpec);
+                boolean use2x2 = fitsPersonalGrid(rSpec);
                 currentTask = new CraftTask(item, count, use2x2);
                 return;
             case "use":
                 currentTask = new UseHeldTask();
                 return;
             case "place":
-                if (parts.length != 2 && parts.length != 5) {
-                    emit("place_failed", "Usage: !place <block> [x y z]");
+                if (parts.length != 5) {
+                    emit("place_failed", "Usage: !place <block> <x> <y> <z>  (coords may be absolute like 100 or relative like ~3 ~ ~-2)");
                     return;
                 }
                 String blockId = parts[1];
-                BlockPos placeTarget = null;
-                if (parts.length == 5) {
-                    try {
-                        int px = Integer.parseInt(parts[2]);
-                        int py = Integer.parseInt(parts[3]);
-                        int pz = Integer.parseInt(parts[4]);
-                        placeTarget = new BlockPos(px, py, pz);
-                    } catch (NumberFormatException e) {
-                        emit("place_failed", "Invalid coordinates in !place " + blockId);
-                        return;
-                    }
+                ClientPlayerEntity pePlace = MinecraftClient.getInstance() == null ? null
+                                            : MinecraftClient.getInstance().player;
+                if (pePlace == null) {
+                    emit("place_failed", "No player — can't resolve place coords.");
+                    return;
                 }
-                currentTask = new PlaceTask(blockId, placeTarget);
+                BlockPos here = pePlace.getBlockPos();
+                Integer px = parseCoord(parts[2], here.getX());
+                Integer py = parseCoord(parts[3], here.getY());
+                Integer pz = parseCoord(parts[4], here.getZ());
+                if (px == null || py == null || pz == null) {
+                    emit("place_failed", "Invalid coord in !place " + blockId
+                        + " " + parts[2] + " " + parts[3] + " " + parts[4]);
+                    return;
+                }
+                currentTask = new PlaceTask(blockId, new BlockPos(px, py, pz));
                 return;
             case "recipes":
                 StringBuilder sb = new StringBuilder("Known recipes: ");
@@ -596,10 +595,12 @@ public class OdysseusDispatcher {
     private static class PlaceTask implements Task {
         private final String blockKey;
         private final String blockItemId;
-        private final BlockPos requestedTarget;   // null → auto (front of player)
+        /** Resolved at construction time — !place always requires explicit
+         *  coords (absolute or ~-relative). No auto/foot-level fallback because
+         *  the player can't cleanly place at their own foot position. */
+        private final BlockPos resolvedTarget;
         private State state = State.CHECK_AND_EQUIP;
         private int ticksInState = 0;
-        private BlockPos resolvedTarget;
         private int hotbarSlotToUse = -1;
 
         enum State { CHECK_AND_EQUIP, WAIT_EQUIP, DO_PLACE, VERIFY, DONE }
@@ -609,12 +610,11 @@ public class OdysseusDispatcher {
             if (norm.startsWith("minecraft:")) norm = norm.substring("minecraft:".length());
             this.blockKey = norm;
             this.blockItemId = "minecraft:" + norm;
-            this.requestedTarget = target;
+            this.resolvedTarget = target;
         }
 
         @Override public String name() {
-            if (requestedTarget == null) return "place " + blockKey;
-            return "place " + blockKey + " at (" + requestedTarget.getX() + "," + requestedTarget.getY() + "," + requestedTarget.getZ() + ")";
+            return "place " + blockKey + " at (" + resolvedTarget.getX() + "," + resolvedTarget.getY() + "," + resolvedTarget.getZ() + ")";
         }
 
         @Override
@@ -635,15 +635,6 @@ public class OdysseusDispatcher {
 
         private void enter(State next) { this.state = next; this.ticksInState = 0; }
 
-        private BlockPos computeAutoTarget(ClientPlayerEntity player) {
-            // Place one block in the direction the player is facing, at foot
-            // level. Requires the block below the target to be solid for
-            // support. If not, the caller will emit place_failed and the model
-            // can retry with explicit coords.
-            Direction facing = player.getHorizontalFacing();
-            return player.getBlockPos().offset(facing);
-        }
-
         private boolean doCheckAndEquip(MinecraftClient client, ClientPlayerEntity player) {
             Item wantItem = itemFromId(blockItemId);
             if (wantItem == null) {
@@ -655,21 +646,17 @@ public class OdysseusDispatcher {
                 emit("place_failed", "Don't have " + blockKey + " in inventory.");
                 return true;
             }
-
-            resolvedTarget = requestedTarget != null ? requestedTarget : computeAutoTarget(player);
-            // Reach check for coord-based placements. Vanilla reach is 4.5
-            // blocks; we're a little strict to leave margin for interact.
-            if (requestedTarget != null) {
-                double dsq = player.getBlockPos().getSquaredDistance(resolvedTarget);
-                if (dsq > 4.0 * 4.0) {
-                    emit("place_failed", "Too far (" + String.format("%.1f", Math.sqrt(dsq))
-                        + " blocks) — walk closer first with #goto "
-                        + resolvedTarget.getX() + " " + resolvedTarget.getY() + " " + resolvedTarget.getZ());
-                    return true;
-                }
+            // Reach check. Vanilla reach is 4.5 blocks; we're a hair inside to
+            // leave margin for interact. Fail with an actionable #goto hint.
+            double dsq = player.getBlockPos().getSquaredDistance(resolvedTarget);
+            if (dsq > 4.0 * 4.0) {
+                emit("place_failed", "Too far (" + String.format("%.1f", Math.sqrt(dsq))
+                    + " blocks) — walk closer first with #goto "
+                    + resolvedTarget.getX() + " " + resolvedTarget.getY() + " " + resolvedTarget.getZ());
+                return true;
             }
 
-            int selected = player.getInventory().selectedSlot;
+            int selected = player.getInventory().getSelectedSlot();
             ItemStack held = player.getInventory().getStack(selected);
             if (held != null && !held.isEmpty() && held.getItem() == wantItem) {
                 // Already holding the right block — skip equip.
@@ -778,6 +765,22 @@ public class OdysseusDispatcher {
 
     private static int parseIntOr(String s, int fallback) {
         try { return Integer.parseInt(s); } catch (NumberFormatException e) { return fallback; }
+    }
+
+    /** Parse a coordinate token in the Minecraft-command style: an integer,
+     *  {@code ~} (= reference), {@code ~N} (= reference + N), or {@code ~-N}.
+     *  Returns null on malformed input. Used by !place. */
+    private static Integer parseCoord(String token, int reference) {
+        if (token == null || token.isEmpty()) return null;
+        try {
+            if (token.charAt(0) == '~') {
+                if (token.length() == 1) return reference;
+                return reference + Integer.parseInt(token.substring(1));
+            }
+            return Integer.parseInt(token);
+        } catch (NumberFormatException e) {
+            return null;
+        }
     }
 
     private static void emit(String event, String text) {

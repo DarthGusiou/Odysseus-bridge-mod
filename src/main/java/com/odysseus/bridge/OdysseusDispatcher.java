@@ -79,6 +79,17 @@ public class OdysseusDispatcher {
         String[] parts = cmd.split("\\s+");
         String verb = parts[0].toLowerCase();
 
+        // Read-only queries: dispatch BEFORE the busy check so the model can
+        // introspect state even while a mine/craft is running.
+        switch (verb) {
+            case "status":
+                emit("status_ok", buildStatus());
+                return;
+            case "inventory":
+                emit("inventory_ok", buildInventory());
+                return;
+        }
+
         if (currentTask != null) {
             emit("busy", "Another Odysseus task is running: " + currentTask.name());
             return;
@@ -105,6 +116,85 @@ public class OdysseusDispatcher {
             default:
                 emit("unknown_command", "Unknown Odysseus command: !" + verb);
         }
+    }
+
+    /** Render current player+world state as a single line. Fields match what
+     *  the session.snapshot envelope emits from Baritone, but as a synchronous
+     *  query the model can call any time via !status. */
+    private static String buildStatus() {
+        MinecraftClient mc = MinecraftClient.getInstance();
+        if (mc == null || mc.player == null || mc.world == null) return "unavailable (no world)";
+        ClientPlayerEntity p = mc.player;
+        BlockPos pos = p.getBlockPos();
+        StringBuilder sb = new StringBuilder();
+        sb.append("pos=(").append(pos.getX()).append(',').append(pos.getY()).append(',').append(pos.getZ()).append(')');
+        Identifier dim = mc.world.getRegistryKey().getValue();
+        sb.append(" dim=").append(dim == null ? "?" : dim.getPath());
+        sb.append(" hp=").append(String.format("%.0f", p.getHealth())).append('/').append(String.format("%.0f", p.getMaxHealth()));
+        sb.append(" hunger=").append(p.getHungerManager().getFoodLevel());
+        try {
+            String biome = mc.world.getBiome(pos).getKey()
+                .map(k -> k.getValue().getPath()).orElse("?");
+            sb.append(" biome=").append(biome);
+        } catch (Throwable ignored) { }
+        long ttime = mc.world.getTimeOfDay() % 24000;
+        sb.append(" time=").append(ttime < 12000 ? "day" : (ttime < 13000 ? "dusk" : (ttime < 23000 ? "night" : "dawn")));
+        sb.append(" held=").append(itemName(p.getMainHandStack()));
+        return sb.toString();
+    }
+
+    /** Render full inventory grouped by section. Empty slots omitted. */
+    private static String buildInventory() {
+        MinecraftClient mc = MinecraftClient.getInstance();
+        if (mc == null || mc.player == null) return "unavailable (no player)";
+        PlayerInventory inv = mc.player.getInventory();
+
+        Map<String, Integer> hotbar = new java.util.LinkedHashMap<>();
+        Map<String, Integer> main = new java.util.LinkedHashMap<>();
+        Map<String, Integer> armor = new java.util.LinkedHashMap<>();
+        Map<String, Integer> offhand = new java.util.LinkedHashMap<>();
+
+        // Slots 0-8 = hotbar, 9-35 = main storage
+        for (int i = 0; i < 9; i++) accumulate(hotbar, inv.getStack(i));
+        for (int i = 9; i < 36; i++) accumulate(main, inv.getStack(i));
+        // Armor slots 36-39 (feet, legs, chest, head)
+        for (int i = 36; i < 40; i++) accumulate(armor, inv.getStack(i));
+        // Offhand slot 40
+        accumulate(offhand, inv.getStack(40));
+
+        StringBuilder sb = new StringBuilder();
+        appendSection(sb, "hotbar", hotbar);
+        appendSection(sb, "main", main);
+        appendSection(sb, "armor", armor);
+        appendSection(sb, "offhand", offhand);
+        if (sb.length() == 0) sb.append("empty");
+        return sb.toString();
+    }
+
+    private static void accumulate(Map<String, Integer> into, ItemStack stack) {
+        if (stack == null || stack.isEmpty()) return;
+        String name = itemName(stack);
+        into.merge(name, stack.getCount(), Integer::sum);
+    }
+
+    private static void appendSection(StringBuilder sb, String label, Map<String, Integer> items) {
+        if (items.isEmpty()) return;
+        if (sb.length() > 0) sb.append(" | ");
+        sb.append(label).append(": ");
+        boolean first = true;
+        for (Map.Entry<String, Integer> e : items.entrySet()) {
+            if (!first) sb.append(", ");
+            first = false;
+            sb.append(e.getKey()).append("×").append(e.getValue());
+        }
+    }
+
+    /** Clean item id, e.g. "diamond_pickaxe" (strip "minecraft:" namespace). */
+    private static String itemName(ItemStack stack) {
+        if (stack == null || stack.isEmpty()) return "empty";
+        Identifier id = Registries.ITEM.getId(stack.getItem());
+        if (id == null) return "unknown";
+        return "minecraft".equals(id.getNamespace()) ? id.getPath() : id.toString();
     }
 
     interface Task {

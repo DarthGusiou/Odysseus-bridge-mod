@@ -578,6 +578,33 @@ public class OdysseusDispatcher {
         }
     }
 
+    /** Return the first placeable neighbor of {@code preferred}, or null if
+     *  no usable spot exists within reach. Prefers the requested spot itself,
+     *  then its 4 horizontal neighbors, then +1 above the requested spot and
+     *  its neighbors. "Placeable" means: currently air, has a solid block
+     *  directly below for support, and within 4 blocks of the player.
+     *  Used by PlaceTask to auto-relocate when the model's chosen offset is
+     *  blocked — avoids the AI looping on the same failing coordinate. */
+    private static BlockPos findPlaceableNear(ClientPlayerEntity player, World world, BlockPos preferred) {
+        BlockPos playerPos = player.getBlockPos();
+        int[][] offsets = new int[][] {
+            {0, 0, 0},
+            {1, 0, 0}, {-1, 0, 0}, {0, 0, 1}, {0, 0, -1},   // horizontal neighbors
+            {0, 1, 0},                                        // one up (in case player is on a step)
+            {1, 1, 0}, {-1, 1, 0}, {0, 1, 1}, {0, 1, -1},    // horizontal neighbors, one up
+            {2, 0, 0}, {-2, 0, 0}, {0, 0, 2}, {0, 0, -2},    // one further out
+        };
+        for (int[] off : offsets) {
+            BlockPos cand = preferred.add(off[0], off[1], off[2]);
+            if (!world.getBlockState(cand).isAir()) continue;
+            if (world.getBlockState(cand.down()).isAir()) continue;
+            double dsq = playerPos.getSquaredDistance(cand);
+            if (dsq > 4.0 * 4.0) continue;
+            return cand;
+        }
+        return null;
+    }
+
     /** Search a 7×4×7 box centered on the player for a crafting_table.
      *  Returns null if none within range. Shared by !craft (to decide 2×2
      *  fallback) and CraftTask.doFindTable. */
@@ -595,10 +622,12 @@ public class OdysseusDispatcher {
     private static class PlaceTask implements Task {
         private final String blockKey;
         private final String blockItemId;
-        /** Resolved at construction time — !place always requires explicit
-         *  coords (absolute or ~-relative). No auto/foot-level fallback because
-         *  the player can't cleanly place at their own foot position. */
-        private final BlockPos resolvedTarget;
+        /** Position the user (model) originally asked for. */
+        private final BlockPos requestedTarget;
+        /** Where we're actually going to place — starts equal to requestedTarget,
+         *  bumped to a nearby offset if the requested spot is occupied but a
+         *  usable neighbor is within reach. */
+        private BlockPos resolvedTarget;
         private State state = State.CHECK_AND_EQUIP;
         private int ticksInState = 0;
         private int hotbarSlotToUse = -1;
@@ -610,11 +639,12 @@ public class OdysseusDispatcher {
             if (norm.startsWith("minecraft:")) norm = norm.substring("minecraft:".length());
             this.blockKey = norm;
             this.blockItemId = "minecraft:" + norm;
+            this.requestedTarget = target;
             this.resolvedTarget = target;
         }
 
         @Override public String name() {
-            return "place " + blockKey + " at (" + resolvedTarget.getX() + "," + resolvedTarget.getY() + "," + resolvedTarget.getZ() + ")";
+            return "place " + blockKey + " at (" + requestedTarget.getX() + "," + requestedTarget.getY() + "," + requestedTarget.getZ() + ")";
         }
 
         @Override
@@ -690,19 +720,24 @@ public class OdysseusDispatcher {
         }
 
         private boolean doDoPlace(MinecraftClient client, ClientPlayerEntity player, World world) {
+            // If the requested position is unusable (occupied, or nothing to
+            // place on), search a small ring of neighbors for a valid spot
+            // instead of hard-failing. The AI can then keep working with the
+            // reported actual position rather than looping on the same offset.
+            BlockPos spot = findPlaceableNear(player, world, resolvedTarget);
+            if (spot == null) {
+                emit("place_failed", "No valid placement spot near ("
+                    + requestedTarget.getX() + "," + requestedTarget.getY() + ","
+                    + requestedTarget.getZ() + ") — requested position and nearby offsets are all occupied, unsupported, or out of reach. Try a different area with #goto or !place at explicit coords further away.");
+                enter(State.DONE); return true;
+            }
+            if (!spot.equals(requestedTarget)) {
+                OdysseusBridge.LOG.info("[odysseus] !place fallback — requested ({},{},{}) unusable, using ({},{},{})",
+                    requestedTarget.getX(), requestedTarget.getY(), requestedTarget.getZ(),
+                    spot.getX(), spot.getY(), spot.getZ());
+            }
+            resolvedTarget = spot;
             BlockPos support = resolvedTarget.down();
-            BlockState supportState = world.getBlockState(support);
-            if (supportState.isAir()) {
-                emit("place_failed", "No solid block below (" + resolvedTarget.getX()
-                    + "," + resolvedTarget.getY() + "," + resolvedTarget.getZ() + ") to place on.");
-                enter(State.DONE); return true;
-            }
-            BlockState existing = world.getBlockState(resolvedTarget);
-            if (!existing.isAir()) {
-                emit("place_failed", "(" + resolvedTarget.getX() + "," + resolvedTarget.getY()
-                    + "," + resolvedTarget.getZ() + ") is already occupied.");
-                enter(State.DONE); return true;
-            }
             // Click the TOP face of the support block to place on top of it.
             Vec3d hitVec = new Vec3d(resolvedTarget.getX() + 0.5,
                                      resolvedTarget.getY(),
@@ -728,8 +763,16 @@ public class OdysseusDispatcher {
                     + ") didn't stick — check facing, reach, or block support.");
                 enter(State.DONE); return true;
             }
+            // If we fell back to a nearby offset, spell that out so the model
+            // updates its mental map and doesn't retry the original coord.
+            String reqPart = "";
+            if (!resolvedTarget.equals(requestedTarget)) {
+                reqPart = " (requested (" + requestedTarget.getX() + "," + requestedTarget.getY()
+                    + "," + requestedTarget.getZ() + ") was occupied — used nearby offset)";
+            }
             emit("place_ok", "Placed " + blockKey + " at ("
-                + resolvedTarget.getX() + "," + resolvedTarget.getY() + "," + resolvedTarget.getZ() + ")");
+                + resolvedTarget.getX() + "," + resolvedTarget.getY() + "," + resolvedTarget.getZ() + ")"
+                + reqPart);
             enter(State.DONE);
             return true;
         }

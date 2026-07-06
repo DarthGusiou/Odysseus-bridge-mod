@@ -10,7 +10,9 @@ import net.minecraft.entity.player.PlayerInventory;
 import net.minecraft.item.Item;
 import net.minecraft.item.ItemStack;
 import net.minecraft.registry.Registries;
+import net.minecraft.block.BlockState;
 import net.minecraft.screen.CraftingScreenHandler;
+import net.minecraft.screen.PlayerScreenHandler;
 import net.minecraft.screen.ScreenHandler;
 import net.minecraft.screen.slot.SlotActionType;
 import net.minecraft.util.Hand;
@@ -103,10 +105,43 @@ public class OdysseusDispatcher {
                     emit("craft_failed", "Invalid count " + count + " (must be 1-999).");
                     return;
                 }
-                currentTask = new CraftTask(item, count);
+                // Prefer the personal 2x2 grid when there's no table nearby AND
+                // the recipe fits in 2x2. Silently transparent to the caller —
+                // the model doesn't care which container was used, just the
+                // outcome. Falls back to the standard table path otherwise.
+                String norm = item.trim().toLowerCase();
+                if (norm.startsWith("minecraft:")) norm = norm.substring("minecraft:".length());
+                RecipeSpec rSpec = RECIPES.get(norm);
+                boolean tableNearby = MinecraftClient.getInstance() != null
+                                      && MinecraftClient.getInstance().player != null
+                                      && MinecraftClient.getInstance().world != null
+                                      && findCraftingTableNear(MinecraftClient.getInstance().player,
+                                                               MinecraftClient.getInstance().world) != null;
+                boolean use2x2 = !tableNearby && fitsPersonalGrid(rSpec);
+                currentTask = new CraftTask(item, count, use2x2);
                 return;
             case "use":
                 currentTask = new UseHeldTask();
+                return;
+            case "place":
+                if (parts.length != 2 && parts.length != 5) {
+                    emit("place_failed", "Usage: !place <block> [x y z]");
+                    return;
+                }
+                String blockId = parts[1];
+                BlockPos placeTarget = null;
+                if (parts.length == 5) {
+                    try {
+                        int px = Integer.parseInt(parts[2]);
+                        int py = Integer.parseInt(parts[3]);
+                        int pz = Integer.parseInt(parts[4]);
+                        placeTarget = new BlockPos(px, py, pz);
+                    } catch (NumberFormatException e) {
+                        emit("place_failed", "Invalid coordinates in !place " + blockId);
+                        return;
+                    }
+                }
+                currentTask = new PlaceTask(blockId, placeTarget);
                 return;
             case "recipes":
                 StringBuilder sb = new StringBuilder("Known recipes: ");
@@ -251,13 +286,28 @@ public class OdysseusDispatcher {
             new String[]{"cobblestone","cobblestone","stick"}));
     }
 
+    /** Recipes whose slots all fall inside the 2x2 sub-grid (top-left 4
+     *  slots of the 3x3 table layout) can be crafted in the player's
+     *  personal inventory grid without a crafting_table. */
+    private static boolean fitsPersonalGrid(RecipeSpec r) {
+        if (r == null) return false;
+        for (int s : r.slots) {
+            if (s != 1 && s != 2 && s != 4 && s != 5) return false;
+        }
+        return true;
+    }
+
     private static class CraftTask implements Task {
         private final String targetItemId;
         private final String targetItemKey;
         private final int targetCount;
         private final RecipeSpec recipe;
+        /** When true, use the player's own 2x2 inventory grid (PlayerScreenHandler);
+         *  no crafting_table needed. Chosen at construction based on recipe shape
+         *  and table availability. */
+        private final boolean use2x2;
 
-        private State state = State.FIND_TABLE;
+        private State state;
         private int ticksInState = 0;
         private int initialInventoryCount = -1;
         private int lastKnownCount = -1;
@@ -270,16 +320,47 @@ public class OdysseusDispatcher {
             CHECK_COUNT, CLEAR_GRID, WAIT_CLEAR, CLOSE, DONE
         }
 
-        CraftTask(String itemId, int count) {
+        CraftTask(String itemId, int count, boolean use2x2) {
             String norm = itemId.trim().toLowerCase();
             if (norm.startsWith("minecraft:")) norm = norm.substring("minecraft:".length());
             this.targetItemKey = norm;
             this.targetItemId = "minecraft:" + norm;
             this.targetCount = Math.max(1, count);
             this.recipe = RECIPES.get(norm);
+            this.use2x2 = use2x2;
+            // 2x2 path skips table-find/screen-open — grid is always available.
+            this.state = use2x2 ? State.PLACE_INGREDIENTS : State.FIND_TABLE;
         }
 
-        @Override public String name() { return "craft " + targetItemKey + " x" + targetCount; }
+        /** Translate a 3x3 grid slot (1-9) to the corresponding player-crafting
+         *  slot (1-4) in the PlayerScreenHandler layout. Only valid on the 2x2
+         *  path where all slots are in {1, 2, 4, 5}. */
+        private int handlerSlot(int gridSlot) {
+            if (!use2x2) return gridSlot;
+            switch (gridSlot) {
+                case 1: return 1;
+                case 2: return 2;
+                case 4: return 3;
+                case 5: return 4;
+                default: return gridSlot;   // unreachable if fitsPersonalGrid returned true
+            }
+        }
+
+        /** First player-inventory slot in the currently-open container.
+         *  CraftingScreenHandler places main inv at slot 10. PlayerScreenHandler
+         *  places main inv at slot 9 (crafting=1-4, armor=5-8, main=9-35, hotbar=36-44). */
+        private int playerInvStart() { return use2x2 ? 9 : 10; }
+
+        /** Last grid slot to clear on cleanup. */
+        private int lastGridSlot() { return use2x2 ? 4 : 9; }
+
+        /** True when the container we need is currently active on the player. */
+        private boolean containerActive(ClientPlayerEntity player) {
+            if (use2x2) return player.currentScreenHandler instanceof PlayerScreenHandler;
+            return player.currentScreenHandler instanceof CraftingScreenHandler;
+        }
+
+        @Override public String name() { return "craft " + targetItemKey + " x" + targetCount + (use2x2 ? " [2x2]" : ""); }
 
         @Override
         public boolean tick(MinecraftClient client) {
@@ -324,15 +405,7 @@ public class OdysseusDispatcher {
                 ingredientIdx = 0; subStep = 0; sourceSlotForCurrent = -1;
                 enter(State.PLACE_INGREDIENTS); return false;
             }
-            BlockPos here = player.getBlockPos();
-            BlockPos found = null;
-            outer:
-            for (int dy = -1; dy <= 2; dy++)
-                for (int dx = -3; dx <= 3; dx++)
-                    for (int dz = -3; dz <= 3; dz++) {
-                        BlockPos p = here.add(dx, dy, dz);
-                        if (world.getBlockState(p).getBlock() == Blocks.CRAFTING_TABLE) { found = p; break outer; }
-                    }
+            BlockPos found = findCraftingTableNear(player, world);
             if (found == null) {
                 emit("craft_failed", "No crafting_table within 3 blocks — walk to one first (#goto crafting_table).");
                 enter(State.DONE); return true;
@@ -362,12 +435,22 @@ public class OdysseusDispatcher {
         private boolean doPlaceIngredients(MinecraftClient client, ClientPlayerEntity player) {
             ScreenHandler h = player.currentScreenHandler;
             ClientPlayerInteractionManager im = client.interactionManager;
-            if (!(h instanceof CraftingScreenHandler) || im == null) {
-                emit("craft_failed", "Crafting screen closed unexpectedly.");
-                enter(State.CLOSE); return false;
+            if (!containerActive(player) || im == null) {
+                emit("craft_failed", (use2x2 ? "Personal " : "") + "Crafting screen unavailable.");
+                enter(use2x2 ? State.DONE : State.CLOSE); return false;
+            }
+            // On the 2x2 path we skipped FIND_TABLE, so capture the initial
+            // inventory count on the first placement tick.
+            if (use2x2 && initialInventoryCount < 0) {
+                initialInventoryCount = countInInventory(player, itemFromId(targetItemId));
+                lastKnownCount = initialInventoryCount;
+                if (initialInventoryCount >= targetCount) {
+                    emit("craft_ok", "Already have " + initialInventoryCount + " " + targetItemKey + " (target " + targetCount + ") — no crafting needed.");
+                    enter(State.DONE); return true;
+                }
             }
             if (ingredientIdx >= recipe.slots.length) { enter(State.TAKE_OUTPUT); return false; }
-            int gridSlot = recipe.slots[ingredientIdx];
+            int gridSlot = handlerSlot(recipe.slots[ingredientIdx]);
             String ingId = recipe.items[ingredientIdx];
             Item ingItem = itemFromId("minecraft:" + ingId);
             if (ingItem == null) {
@@ -376,7 +459,7 @@ public class OdysseusDispatcher {
             }
             switch (subStep) {
                 case 0: {
-                    int sourceSlot = findItemSlotInHandler(h, ingItem, 10);
+                    int sourceSlot = findItemSlotInHandler(h, ingItem, playerInvStart());
                     if (sourceSlot < 0) {
                         emit("craft_failed", "Missing " + ingId + " for " + targetItemKey);
                         enter(State.CLEAR_GRID); return false;
@@ -408,7 +491,7 @@ public class OdysseusDispatcher {
 
         private boolean doTakeOutput(MinecraftClient client, ClientPlayerEntity player) {
             ScreenHandler h = player.currentScreenHandler;
-            if (!(h instanceof CraftingScreenHandler)) {
+            if (!containerActive(player)) {
                 emit("craft_failed", "Crafting screen closed unexpectedly.");
                 enter(State.DONE); return true;
             }
@@ -453,13 +536,13 @@ public class OdysseusDispatcher {
         private boolean doClearGrid(MinecraftClient client, ClientPlayerEntity player) {
             ScreenHandler h = player.currentScreenHandler;
             ClientPlayerInteractionManager im = client.interactionManager;
-            if (!(h instanceof CraftingScreenHandler) || im == null) { enter(State.CLOSE); return false; }
-            for (int i = 1; i <= 9; i++) {
+            if (!containerActive(player) || im == null) { enter(use2x2 ? State.DONE : State.CLOSE); return false; }
+            for (int i = 1; i <= lastGridSlot(); i++) {
                 if (!h.slots.get(i).getStack().isEmpty()) {
                     im.clickSlot(h.syncId, i, 0, SlotActionType.QUICK_MOVE, player);
                 }
             }
-            enter(State.WAIT_CLEAR); return false;
+            enter(use2x2 ? State.DONE : State.WAIT_CLEAR); return false;
         }
 
         private boolean doWaitClear() {
@@ -492,6 +575,175 @@ public class OdysseusDispatcher {
             }
             client.interactionManager.interactItem(player, Hand.MAIN_HAND);
             emit("use_ok", "Used held item.");
+            return true;
+        }
+    }
+
+    /** Search a 7×4×7 box centered on the player for a crafting_table.
+     *  Returns null if none within range. Shared by !craft (to decide 2×2
+     *  fallback) and CraftTask.doFindTable. */
+    private static BlockPos findCraftingTableNear(ClientPlayerEntity player, World world) {
+        BlockPos here = player.getBlockPos();
+        for (int dy = -1; dy <= 2; dy++)
+            for (int dx = -3; dx <= 3; dx++)
+                for (int dz = -3; dz <= 3; dz++) {
+                    BlockPos p = here.add(dx, dy, dz);
+                    if (world.getBlockState(p).getBlock() == Blocks.CRAFTING_TABLE) return p;
+                }
+        return null;
+    }
+
+    private static class PlaceTask implements Task {
+        private final String blockKey;
+        private final String blockItemId;
+        private final BlockPos requestedTarget;   // null → auto (front of player)
+        private State state = State.CHECK_AND_EQUIP;
+        private int ticksInState = 0;
+        private BlockPos resolvedTarget;
+        private int hotbarSlotToUse = -1;
+
+        enum State { CHECK_AND_EQUIP, WAIT_EQUIP, DO_PLACE, VERIFY, DONE }
+
+        PlaceTask(String blockId, BlockPos target) {
+            String norm = blockId.trim().toLowerCase();
+            if (norm.startsWith("minecraft:")) norm = norm.substring("minecraft:".length());
+            this.blockKey = norm;
+            this.blockItemId = "minecraft:" + norm;
+            this.requestedTarget = target;
+        }
+
+        @Override public String name() {
+            if (requestedTarget == null) return "place " + blockKey;
+            return "place " + blockKey + " at (" + requestedTarget.getX() + "," + requestedTarget.getY() + "," + requestedTarget.getZ() + ")";
+        }
+
+        @Override
+        public boolean tick(MinecraftClient client) {
+            ClientPlayerEntity player = client.player;
+            World world = client.world;
+            if (player == null || world == null) return true;
+            ticksInState++;
+            switch (state) {
+                case CHECK_AND_EQUIP: return doCheckAndEquip(client, player);
+                case WAIT_EQUIP:      return doWaitEquip();
+                case DO_PLACE:        return doDoPlace(client, player, world);
+                case VERIFY:          return doVerify(client, player, world);
+                case DONE:            return true;
+            }
+            return true;
+        }
+
+        private void enter(State next) { this.state = next; this.ticksInState = 0; }
+
+        private BlockPos computeAutoTarget(ClientPlayerEntity player) {
+            // Place one block in the direction the player is facing, at foot
+            // level. Requires the block below the target to be solid for
+            // support. If not, the caller will emit place_failed and the model
+            // can retry with explicit coords.
+            Direction facing = player.getHorizontalFacing();
+            return player.getBlockPos().offset(facing);
+        }
+
+        private boolean doCheckAndEquip(MinecraftClient client, ClientPlayerEntity player) {
+            Item wantItem = itemFromId(blockItemId);
+            if (wantItem == null) {
+                emit("place_failed", "Unknown block: " + blockKey);
+                return true;
+            }
+            int have = countInInventory(player, wantItem);
+            if (have <= 0) {
+                emit("place_failed", "Don't have " + blockKey + " in inventory.");
+                return true;
+            }
+
+            resolvedTarget = requestedTarget != null ? requestedTarget : computeAutoTarget(player);
+            // Reach check for coord-based placements. Vanilla reach is 4.5
+            // blocks; we're a little strict to leave margin for interact.
+            if (requestedTarget != null) {
+                double dsq = player.getBlockPos().getSquaredDistance(resolvedTarget);
+                if (dsq > 4.0 * 4.0) {
+                    emit("place_failed", "Too far (" + String.format("%.1f", Math.sqrt(dsq))
+                        + " blocks) — walk closer first with #goto "
+                        + resolvedTarget.getX() + " " + resolvedTarget.getY() + " " + resolvedTarget.getZ());
+                    return true;
+                }
+            }
+
+            int selected = player.getInventory().selectedSlot;
+            ItemStack held = player.getInventory().getStack(selected);
+            if (held != null && !held.isEmpty() && held.getItem() == wantItem) {
+                // Already holding the right block — skip equip.
+                hotbarSlotToUse = selected;
+                enter(State.DO_PLACE);
+                return false;
+            }
+            // Find the item somewhere in inventory (skipping crafting/armor
+            // slots at 0-8 of the player screen handler).
+            PlayerScreenHandler h = player.playerScreenHandler;
+            int srcSlot = findItemSlotInHandler(h, wantItem, 9);
+            if (srcSlot < 0) {
+                emit("place_failed", "Don't have " + blockKey + " in inventory.");
+                return true;
+            }
+            ClientPlayerInteractionManager im = client.interactionManager;
+            if (im == null) {
+                emit("place_failed", "No interaction manager.");
+                return true;
+            }
+            // SWAP action: button param = target hotbar slot (0-8).
+            hotbarSlotToUse = selected;
+            im.clickSlot(h.syncId, srcSlot, selected, SlotActionType.SWAP, player);
+            enter(State.WAIT_EQUIP);
+            return false;
+        }
+
+        private boolean doWaitEquip() {
+            if (ticksInState >= 3) enter(State.DO_PLACE);
+            return false;
+        }
+
+        private boolean doDoPlace(MinecraftClient client, ClientPlayerEntity player, World world) {
+            BlockPos support = resolvedTarget.down();
+            BlockState supportState = world.getBlockState(support);
+            if (supportState.isAir()) {
+                emit("place_failed", "No solid block below (" + resolvedTarget.getX()
+                    + "," + resolvedTarget.getY() + "," + resolvedTarget.getZ() + ") to place on.");
+                enter(State.DONE); return true;
+            }
+            BlockState existing = world.getBlockState(resolvedTarget);
+            if (!existing.isAir()) {
+                emit("place_failed", "(" + resolvedTarget.getX() + "," + resolvedTarget.getY()
+                    + "," + resolvedTarget.getZ() + ") is already occupied.");
+                enter(State.DONE); return true;
+            }
+            // Click the TOP face of the support block to place on top of it.
+            Vec3d hitVec = new Vec3d(resolvedTarget.getX() + 0.5,
+                                     resolvedTarget.getY(),
+                                     resolvedTarget.getZ() + 0.5);
+            BlockHitResult hit = new BlockHitResult(hitVec, Direction.UP, support, false);
+            ClientPlayerInteractionManager im = client.interactionManager;
+            if (im == null) {
+                emit("place_failed", "No interaction manager.");
+                enter(State.DONE); return true;
+            }
+            im.interactBlock(player, Hand.MAIN_HAND, hit);
+            enter(State.VERIFY);
+            return false;
+        }
+
+        private boolean doVerify(MinecraftClient client, ClientPlayerEntity player, World world) {
+            // One tick delay to let the server round-trip.
+            if (ticksInState < 2) return false;
+            BlockState nowAt = world.getBlockState(resolvedTarget);
+            if (nowAt.isAir()) {
+                emit("place_failed", "Placement of " + blockKey + " at ("
+                    + resolvedTarget.getX() + "," + resolvedTarget.getY() + "," + resolvedTarget.getZ()
+                    + ") didn't stick — check facing, reach, or block support.");
+                enter(State.DONE); return true;
+            }
+            emit("place_ok", "Placed " + blockKey + " at ("
+                + resolvedTarget.getX() + "," + resolvedTarget.getY() + "," + resolvedTarget.getZ() + ")");
+            enter(State.DONE);
             return true;
         }
     }

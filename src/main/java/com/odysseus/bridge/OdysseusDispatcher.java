@@ -395,7 +395,7 @@ public class OdysseusDispatcher {
             // Also saves ingredients when the AI double-dispatches by mistake.
             int haveInit = countInInventory(player, itemFromId(targetItemId));
             if (haveInit >= targetCount) {
-                emit("craft_ok", "Already have " + haveInit + " " + targetItemKey + " (target " + targetCount + ") — no crafting needed.");
+                emit("craft_ok", "You already have " + haveInit + " " + targetItemKey + " in inventory (target was " + targetCount + ") — no crafting needed.");
                 enter(State.DONE); return true;
             }
             if (player.currentScreenHandler instanceof CraftingScreenHandler) {
@@ -444,7 +444,7 @@ public class OdysseusDispatcher {
                 initialInventoryCount = countInInventory(player, itemFromId(targetItemId));
                 lastKnownCount = initialInventoryCount;
                 if (initialInventoryCount >= targetCount) {
-                    emit("craft_ok", "Already have " + initialInventoryCount + " " + targetItemKey + " (target " + targetCount + ") — no crafting needed.");
+                    emit("craft_ok", "You already have " + initialInventoryCount + " " + targetItemKey + " in inventory (target was " + targetCount + ") — no crafting needed.");
                     enter(State.DONE); return true;
                 }
             }
@@ -498,7 +498,7 @@ public class OdysseusDispatcher {
             if (outputStack.isEmpty()) {
                 int haveNow = countInInventory(player, itemFromId(targetItemId));
                 int delta = haveNow - initialInventoryCount;
-                if (delta > 0) emit("craft_ok", "Crafted " + delta + " " + targetItemKey + " (inventory now: " + haveNow + ")");
+                if (delta > 0) emit("craft_ok", "You now have " + haveNow + " " + targetItemKey + " total in inventory (crafted " + delta + " this run).");
                 else emit("craft_failed", "Grid empty — ingredient placement failed for " + targetItemKey);
                 enter(State.CLEAR_GRID); return false;
             }
@@ -520,11 +520,13 @@ public class OdysseusDispatcher {
             // this run's delta hits it. Prevents !craft stone_axe 1 (when
             // you already have 1) from ending at inventory 2.
             if (haveNow >= targetCount) {
-                emit("craft_ok", "Crafted " + crafted + " " + targetItemKey + " (target " + targetCount + ", inventory " + haveNow + ")");
+                // Phrasing: lead with the definitive "you now have N" so smaller
+                // models don't latch onto the target field and forget the total.
+                emit("craft_ok", "You now have " + haveNow + " " + targetItemKey + " total in inventory (crafted " + crafted + " this run, target was " + targetCount + ").");
                 enter(State.CLEAR_GRID); return false;
             }
             if (haveNow == lastKnownCount) {
-                emit("craft_failed", "Stopped at inventory " + haveNow + "/" + targetCount + " — no more ingredients for " + targetItemKey);
+                emit("craft_failed", "You have " + haveNow + " " + targetItemKey + " in inventory (target was " + targetCount + ") — ran out of ingredients before hitting target.");
                 enter(State.CLEAR_GRID); return false;
             }
             lastKnownCount = haveNow;

@@ -245,6 +245,50 @@ public class OdysseusDispatcher {
         }
     }
 
+    // ── Wood-family recipe substitution ──────────────────────────────────
+    // Vanilla recipes that use the #minecraft:planks or #minecraft:wooden_slabs
+    // tags accept ANY variant of that family. The recipes.json we import
+    // from Prismarine's minecraft-data expands each tag into one variant per
+    // wood, and we only registered the first variant — so a bare
+    // `!craft bowl` would demand whatever plank type the JSON happened to
+    // list first (often cherry_planks). Instead, CraftTask.doPlaceIngredients
+    // checks these sets and, for matching recipes, substitutes any-plank or
+    // any-wooden-slab from inventory.
+    //
+    // Verified against 1.21.8 recipes.json — see scratchpad/wood_variant_recipes.json.
+    // 25 total (Group A: 20 planks-only; Group B: 2 mixed; Group C: 3 slab-only).
+
+    /** All 12 plank items in 1.21.8. */
+    private static final java.util.Set<String> PLANK_ITEMS = java.util.Set.of(
+        "oak_planks", "birch_planks", "spruce_planks", "jungle_planks",
+        "acacia_planks", "dark_oak_planks", "mangrove_planks", "cherry_planks",
+        "pale_oak_planks", "crimson_planks", "warped_planks", "bamboo_planks"
+    );
+
+    /** All 12 wooden slab items in 1.21.8 (matches #wooden_slabs per the data). */
+    private static final java.util.Set<String> WOODEN_SLAB_ITEMS = java.util.Set.of(
+        "oak_slab", "birch_slab", "spruce_slab", "jungle_slab",
+        "acacia_slab", "dark_oak_slab", "mangrove_slab", "cherry_slab",
+        "pale_oak_slab", "crimson_slab", "warped_slab", "bamboo_slab"
+    );
+
+    /** Recipes whose _planks ingredient positions accept ANY plank variant.
+     *  Groups A + B — the 22 vanilla recipes tagged with #minecraft:planks. */
+    private static final java.util.Set<String> PLANK_ACCEPTING_RECIPES = java.util.Set.of(
+        "beehive", "bookshelf", "bowl", "cartography_table", "chest",
+        "crafting_table", "fletching_table", "grindstone", "jukebox", "loom",
+        "note_block", "piston", "shield", "smithing_table", "tripwire_hook",
+        "wooden_axe", "wooden_hoe", "wooden_pickaxe", "wooden_shovel", "wooden_sword",
+        "barrel", "chiseled_bookshelf"
+    );
+
+    /** Recipes whose _slab ingredient positions accept ANY wooden slab variant.
+     *  Groups B + C — the 5 vanilla recipes tagged with #minecraft:wooden_slabs. */
+    private static final java.util.Set<String> WOODEN_SLAB_ACCEPTING_RECIPES = java.util.Set.of(
+        "composter", "daylight_detector", "lectern",
+        "barrel", "chiseled_bookshelf"
+    );
+
     private static final Map<String, RecipeSpec> RECIPES = new HashMap<>();
     static {
         String[][] plankMap = {
@@ -1271,9 +1315,31 @@ public class OdysseusDispatcher {
             }
             switch (subStep) {
                 case 0: {
-                    int sourceSlot = findItemSlotInHandler(h, ingItem, playerInvStart());
+                    // Wood-family substitution: if this recipe accepts any
+                    // plank (or any wooden slab), search inventory as a set
+                    // instead of demanding the exact plank type the recipe
+                    // was registered with. Falls through to the plain
+                    // findItemSlotInHandler when the recipe/ingredient combo
+                    // is not tag-based.
+                    int sourceSlot;
+                    if (PLANK_ACCEPTING_RECIPES.contains(targetItemKey)
+                            && PLANK_ITEMS.contains(ingId)) {
+                        sourceSlot = findAnyOfInHandler(h, PLANK_ITEMS, playerInvStart());
+                    } else if (WOODEN_SLAB_ACCEPTING_RECIPES.contains(targetItemKey)
+                            && WOODEN_SLAB_ITEMS.contains(ingId)) {
+                        sourceSlot = findAnyOfInHandler(h, WOODEN_SLAB_ITEMS, playerInvStart());
+                    } else {
+                        sourceSlot = findItemSlotInHandler(h, ingItem, playerInvStart());
+                    }
                     if (sourceSlot < 0) {
-                        emit("craft_failed", "Missing " + ingId + " for " + targetItemKey);
+                        // "Missing planks" is friendlier than "Missing cherry_planks"
+                        // when any plank would have worked.
+                        String friendly = ingId;
+                        if (PLANK_ACCEPTING_RECIPES.contains(targetItemKey)
+                                && PLANK_ITEMS.contains(ingId)) friendly = "any planks";
+                        else if (WOODEN_SLAB_ACCEPTING_RECIPES.contains(targetItemKey)
+                                && WOODEN_SLAB_ITEMS.contains(ingId)) friendly = "any wooden slab";
+                        emit("craft_failed", "Missing " + friendly + " for " + targetItemKey);
                         enter(State.CLEAR_GRID); return false;
                     }
                     sourceSlotForCurrent = sourceSlot;
@@ -1597,6 +1663,23 @@ public class OdysseusDispatcher {
         for (int i = startFromSlot; i < h.slots.size(); i++) {
             ItemStack s = h.slots.get(i).getStack();
             if (!s.isEmpty() && s.getItem() == item) return i;
+        }
+        return -1;
+    }
+
+    /** Return the slot index of any item whose Minecraft-id path is in
+     *  {@code allowedNames}. Used by wood-family recipe substitution — the
+     *  registered ingredient is e.g. "cherry_planks" but the recipe accepts
+     *  any of the 12 plank variants, so we scan for the SET. Bare-minecraft
+     *  namespace only (no cross-mod matching). Returns -1 if none found. */
+    private static int findAnyOfInHandler(ScreenHandler h, java.util.Set<String> allowedNames, int startFromSlot) {
+        for (int i = startFromSlot; i < h.slots.size(); i++) {
+            ItemStack s = h.slots.get(i).getStack();
+            if (s.isEmpty()) continue;
+            Identifier id = Registries.ITEM.getId(s.getItem());
+            if (id == null) continue;
+            String name = "minecraft".equals(id.getNamespace()) ? id.getPath() : id.toString();
+            if (allowedNames.contains(name)) return i;
         }
         return -1;
     }

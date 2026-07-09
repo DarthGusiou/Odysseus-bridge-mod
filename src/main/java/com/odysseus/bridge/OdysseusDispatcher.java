@@ -329,11 +329,16 @@ public class OdysseusDispatcher {
             new String[]{"cobblestone","cobblestone","stick"}));
 
         // ── Auto-generated from Prismarine minecraft-data 1.21.8 ────────
-        //   Source: recipes.json (829 result items, 1 variant each — first)
-        //   Extractor: scratchpad/extract_recipes.py
-        //   Skipped: existing hand-crafted (planks/stick/wood+stone tools/table/torch/
-        //            furnace/chest) whose oak_planks preference is preserved.
+        //   Split across helper methods to stay under the JVM's per-method
+        //   64KB bytecode limit. Each helper carries at most CHUNK_SIZE lines.
+        registerAutoRecipes1();
+        registerAutoRecipes2();
+        registerAutoRecipes3();
+        registerAutoRecipes4();
+        registerAutoRecipes5();
+    }
 
+    private static void registerAutoRecipes1() {
         RECIPES.put("granite", new RecipeSpec(1, new int[]{1, 2}, new String[]{"diorite", "quartz"}));
         RECIPES.put("polished_granite", new RecipeSpec(4, new int[]{1, 2, 4, 5}, new String[]{"granite", "granite", "granite", "granite"}));
         RECIPES.put("diorite", new RecipeSpec(2, new int[]{1, 2, 4, 5}, new String[]{"cobblestone", "quartz", "quartz", "cobblestone"}));
@@ -534,6 +539,9 @@ public class OdysseusDispatcher {
         RECIPES.put("resin_brick_wall", new RecipeSpec(6, new int[]{1, 2, 3, 4, 5, 6}, new String[]{"resin_bricks", "resin_bricks", "resin_bricks", "resin_bricks", "resin_bricks", "resin_bricks"}));
         RECIPES.put("chiseled_resin_bricks", new RecipeSpec(1, new int[]{1, 4}, new String[]{"resin_brick_slab", "resin_brick_slab"}));
         RECIPES.put("brick_stairs", new RecipeSpec(4, new int[]{1, 4, 5, 7, 8, 9}, new String[]{"bricks", "bricks", "bricks", "bricks", "bricks", "bricks"}));
+    }
+
+    private static void registerAutoRecipes2() {
         RECIPES.put("stone_brick_stairs", new RecipeSpec(4, new int[]{1, 4, 5, 7, 8, 9}, new String[]{"stone_bricks", "stone_bricks", "stone_bricks", "stone_bricks", "stone_bricks", "stone_bricks"}));
         RECIPES.put("mud_brick_stairs", new RecipeSpec(4, new int[]{1, 4, 5, 7, 8, 9}, new String[]{"mud_bricks", "mud_bricks", "mud_bricks", "mud_bricks", "mud_bricks", "mud_bricks"}));
         RECIPES.put("nether_bricks", new RecipeSpec(1, new int[]{1, 2, 4, 5}, new String[]{"nether_brick", "nether_brick", "nether_brick", "nether_brick"}));
@@ -734,6 +742,9 @@ public class OdysseusDispatcher {
         RECIPES.put("slime_block", new RecipeSpec(1, new int[]{1, 2, 3, 4, 5, 6, 7, 8, 9}, new String[]{"slime_ball", "slime_ball", "slime_ball", "slime_ball", "slime_ball", "slime_ball", "slime_ball", "slime_ball", "slime_ball"}));
         RECIPES.put("honey_block", new RecipeSpec(1, new int[]{1, 2, 4, 5}, new String[]{"honey_bottle", "honey_bottle", "honey_bottle", "honey_bottle"}));
         RECIPES.put("observer", new RecipeSpec(1, new int[]{1, 2, 3, 4, 5, 6, 7, 8, 9}, new String[]{"cobblestone", "cobblestone", "cobblestone", "redstone", "redstone", "quartz", "cobblestone", "cobblestone", "cobblestone"}));
+    }
+
+    private static void registerAutoRecipes3() {
         RECIPES.put("hopper", new RecipeSpec(1, new int[]{1, 3, 4, 5, 6, 8}, new String[]{"iron_ingot", "iron_ingot", "iron_ingot", "chest", "iron_ingot", "iron_ingot"}));
         RECIPES.put("dispenser", new RecipeSpec(1, new int[]{1, 2, 3, 4, 5, 6, 7, 8, 9}, new String[]{"cobblestone", "cobblestone", "cobblestone", "cobblestone", "bow", "cobblestone", "cobblestone", "redstone", "cobblestone"}));
         RECIPES.put("dropper", new RecipeSpec(1, new int[]{1, 2, 3, 4, 6, 7, 8, 9}, new String[]{"cobblestone", "cobblestone", "cobblestone", "cobblestone", "cobblestone", "cobblestone", "redstone", "cobblestone"}));
@@ -934,6 +945,9 @@ public class OdysseusDispatcher {
         RECIPES.put("birch_sign", new RecipeSpec(3, new int[]{1, 2, 3, 4, 5, 6, 8}, new String[]{"birch_planks", "birch_planks", "birch_planks", "birch_planks", "birch_planks", "birch_planks", "stick"}));
         RECIPES.put("jungle_sign", new RecipeSpec(3, new int[]{1, 2, 3, 4, 5, 6, 8}, new String[]{"jungle_planks", "jungle_planks", "jungle_planks", "jungle_planks", "jungle_planks", "jungle_planks", "stick"}));
         RECIPES.put("acacia_sign", new RecipeSpec(3, new int[]{1, 2, 3, 4, 5, 6, 8}, new String[]{"acacia_planks", "acacia_planks", "acacia_planks", "acacia_planks", "acacia_planks", "acacia_planks", "stick"}));
+    }
+
+    private static void registerAutoRecipes4() {
         RECIPES.put("cherry_sign", new RecipeSpec(3, new int[]{1, 2, 3, 4, 5, 6, 8}, new String[]{"cherry_planks", "cherry_planks", "cherry_planks", "cherry_planks", "cherry_planks", "cherry_planks", "stick"}));
         RECIPES.put("dark_oak_sign", new RecipeSpec(3, new int[]{1, 2, 3, 4, 5, 6, 8}, new String[]{"dark_oak_planks", "dark_oak_planks", "dark_oak_planks", "dark_oak_planks", "dark_oak_planks", "dark_oak_planks", "stick"}));
         RECIPES.put("pale_oak_sign", new RecipeSpec(3, new int[]{1, 2, 3, 4, 5, 6, 8}, new String[]{"pale_oak_planks", "pale_oak_planks", "pale_oak_planks", "pale_oak_planks", "pale_oak_planks", "pale_oak_planks", "stick"}));
@@ -1134,6 +1148,9 @@ public class OdysseusDispatcher {
         RECIPES.put("waxed_oxidized_copper_grate", new RecipeSpec(4, new int[]{2, 4, 6, 8}, new String[]{"waxed_oxidized_copper", "waxed_oxidized_copper", "waxed_oxidized_copper", "waxed_oxidized_copper"}));
         RECIPES.put("copper_bulb", new RecipeSpec(4, new int[]{2, 4, 5, 6, 8}, new String[]{"copper_block", "copper_block", "blaze_rod", "copper_block", "redstone"}));
         RECIPES.put("exposed_copper_bulb", new RecipeSpec(4, new int[]{2, 4, 5, 6, 8}, new String[]{"exposed_copper", "exposed_copper", "blaze_rod", "exposed_copper", "redstone"}));
+    }
+
+    private static void registerAutoRecipes5() {
         RECIPES.put("weathered_copper_bulb", new RecipeSpec(4, new int[]{2, 4, 5, 6, 8}, new String[]{"weathered_copper", "weathered_copper", "blaze_rod", "weathered_copper", "redstone"}));
         RECIPES.put("oxidized_copper_bulb", new RecipeSpec(4, new int[]{2, 4, 5, 6, 8}, new String[]{"oxidized_copper", "oxidized_copper", "blaze_rod", "oxidized_copper", "redstone"}));
         RECIPES.put("waxed_copper_bulb", new RecipeSpec(4, new int[]{2, 4, 5, 6, 8}, new String[]{"waxed_copper_block", "waxed_copper_block", "blaze_rod", "waxed_copper_block", "redstone"}));
@@ -1141,6 +1158,7 @@ public class OdysseusDispatcher {
         RECIPES.put("waxed_weathered_copper_bulb", new RecipeSpec(4, new int[]{2, 4, 5, 6, 8}, new String[]{"waxed_weathered_copper", "waxed_weathered_copper", "blaze_rod", "waxed_weathered_copper", "redstone"}));
         RECIPES.put("waxed_oxidized_copper_bulb", new RecipeSpec(4, new int[]{2, 4, 5, 6, 8}, new String[]{"waxed_oxidized_copper", "waxed_oxidized_copper", "blaze_rod", "waxed_oxidized_copper", "redstone"}));
     }
+
 
     /** Recipes whose slots all fall inside the 2x2 sub-grid (top-left 4
      *  slots of the 3x3 table layout) can be crafted in the player's

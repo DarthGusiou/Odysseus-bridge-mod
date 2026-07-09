@@ -11,7 +11,7 @@ A client-side Fabric mod that connects Baritone to Odysseus over a **local WebSo
 
 **Nothing gets sent through Minecraft chat.**
 
-## Building it (GitHub Actions — no local Java needed)
+## Building it (GitHub Actions — no local Java needed unless wanted)
 
 Because you can't build Java projects locally, use GitHub to compile the jar for you. Full process:
 
